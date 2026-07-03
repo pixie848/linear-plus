@@ -660,75 +660,199 @@ function formatDownloadPercent(percent) {
   return colorRgb(`${String(rounded).padStart(3, " ")}%`, rgb);
 }
 
-async function getDownloadTotalBytes(context, download) {
-  if (!download || typeof download.url !== "function") {
-    return 0;
-  }
-
-  const url = download.url();
-  if (!/^https?:\/\//i.test(url)) {
-    return 0;
-  }
-
+function fileSize(filePath) {
   try {
-    const response = await context.request.head(url, { timeout: 5000 });
-    const length = Number(response.headers()["content-length"]);
-    return Number.isFinite(length) && length > 0 ? length : 0;
+    return fs.statSync(filePath).size;
   } catch {
     return 0;
   }
 }
 
-// Poll the file on disk to drive the "generating loader" line: a real percent
-// when we know the total size (otherwise an eased estimate) plus a live download
-// speed measured from how fast the file is growing.
-function trackDownloadProgress(board, savePath, totalBytes) {
-  let lastSize = 0;
-  let lastTime = Date.now();
+function averageSpeed(bytes, startedAt) {
+  const seconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
+  return bytes / seconds;
+}
+
+function estimateUnknownDownloadPercent(receivedBytes, startedAt) {
+  if (receivedBytes <= 0) {
+    return 0;
+  }
+
+  const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0);
+  const byteProgress = Math.log2(receivedBytes / 65536 + 1) * 8;
+  return Math.min(95, byteProgress + elapsedSeconds * 1.5);
+}
+
+function createEstimatedDownloadProgressTracker(board) {
+  const startedAt = Date.now();
   let percent = 0;
-  let frame = 0;
-  let speed = 0;
+  let stopped = false;
 
-  const tick = () => {
-    frame += 1;
-
-    let size = 0;
-    try {
-      if (fs.existsSync(savePath)) {
-        size = fs.statSync(savePath).size;
-      }
-    } catch {
-      // The file can be briefly locked while the browser writes it.
-    }
-
-    const now = Date.now();
-    const seconds = (now - lastTime) / 1000;
-    if (seconds > 0 && size >= lastSize) {
-      speed = (size - lastSize) / seconds;
-    }
-    lastSize = size;
-    lastTime = now;
-
-    if (totalBytes > 0) {
-      percent = Math.max(percent, Math.min(99, (size / totalBytes) * 100));
-    } else {
-      percent = Math.min(95, frame * 1.5);
-    }
-
-    board.setDetail("generate", formatDownloadDetail(percent, speed));
-  };
-
-  const timer = setInterval(tick, STATUS_TICK_MS);
+  const timer = setInterval(() => {
+    percent = Math.min(95, percent + 1.25);
+    board.setDetail("generate", formatDownloadDetail(percent, 0));
+  }, STATUS_TICK_MS);
 
   return {
-    finish() {
+    finish(finalBytes = 0) {
+      if (stopped) {
+        return;
+      }
+
+      stopped = true;
       clearInterval(timer);
-      board.setDetail("generate", formatDownloadDetail(100, speed));
+      board.setDetail("generate", formatDownloadDetail(100, averageSpeed(finalBytes, startedAt)));
+    },
+    stop() {
+      if (stopped) {
+        return;
+      }
+
+      stopped = true;
+      clearInterval(timer);
     },
   };
 }
 
-async function downloadLoader(board, context, page, generateButton) {
+function createBrowserDownloadProgressTracker(board, session) {
+  let activeGuid = "";
+  let startedAt = 0;
+  let lastTime = 0;
+  let lastBytes = 0;
+  let receivedBytes = 0;
+  let totalBytes = 0;
+  let speed = 0;
+  let completed = false;
+  let cleaned = false;
+
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+
+    cleaned = true;
+    session.off("Browser.downloadWillBegin", onDownloadWillBegin);
+    session.off("Browser.downloadProgress", onDownloadProgress);
+  };
+
+  const ensureStarted = () => {
+    if (startedAt) {
+      return;
+    }
+
+    startedAt = Date.now();
+    lastTime = startedAt;
+    lastBytes = receivedBytes;
+  };
+
+  const paintProgress = (percent, bytesPerSecond) => {
+    board.setDetail("generate", formatDownloadDetail(percent, bytesPerSecond));
+  };
+
+  const updateFromBytes = (nextReceivedBytes, nextTotalBytes, state) => {
+    ensureStarted();
+
+    receivedBytes = Math.max(receivedBytes, nextReceivedBytes);
+    totalBytes = Math.max(totalBytes, nextTotalBytes);
+
+    const now = Date.now();
+    const seconds = (now - lastTime) / 1000;
+    if (seconds > 0 && receivedBytes >= lastBytes) {
+      speed = (receivedBytes - lastBytes) / seconds;
+      lastBytes = receivedBytes;
+      lastTime = now;
+    }
+
+    if (state === "completed") {
+      completed = true;
+      const finalBytes = Math.max(receivedBytes, totalBytes);
+      paintProgress(100, averageSpeed(finalBytes, startedAt));
+      cleanup();
+      return;
+    }
+
+    if (state === "canceled") {
+      cleanup();
+      return;
+    }
+
+    const percent =
+      totalBytes > 0
+        ? Math.min(99, (receivedBytes / totalBytes) * 100)
+        : estimateUnknownDownloadPercent(receivedBytes, startedAt);
+    paintProgress(percent, speed);
+  };
+
+  function onDownloadWillBegin(event) {
+    if (activeGuid) {
+      return;
+    }
+
+    activeGuid = event.guid;
+    receivedBytes = 0;
+    totalBytes = 0;
+    startedAt = Date.now();
+    lastTime = startedAt;
+    lastBytes = 0;
+    speed = 0;
+  }
+
+  function onDownloadProgress(event) {
+    if (!activeGuid) {
+      activeGuid = event.guid;
+    }
+
+    if (event.guid !== activeGuid) {
+      return;
+    }
+
+    updateFromBytes(
+      Number(event.receivedBytes) || 0,
+      Number(event.totalBytes) || 0,
+      event.state
+    );
+  }
+
+  session.on("Browser.downloadWillBegin", onDownloadWillBegin);
+  session.on("Browser.downloadProgress", onDownloadProgress);
+
+  return {
+    finish(finalBytes = 0) {
+      if (completed) {
+        return;
+      }
+
+      ensureStarted();
+      const bytes = Math.max(receivedBytes, totalBytes, finalBytes);
+      completed = true;
+      paintProgress(100, averageSpeed(bytes, startedAt));
+      cleanup();
+    },
+    stop() {
+      cleanup();
+    },
+  };
+}
+
+async function createDownloadProgressTracker(board, browser) {
+  if (!browser || typeof browser.newBrowserCDPSession !== "function") {
+    return createEstimatedDownloadProgressTracker(board);
+  }
+
+  try {
+    const session = await browser.newBrowserCDPSession();
+    await session.send("Browser.setDownloadBehavior", {
+      behavior: "allow",
+      downloadPath: DOWNLOAD_DIR,
+      eventsEnabled: true,
+    });
+    return createBrowserDownloadProgressTracker(board, session);
+  } catch {
+    return createEstimatedDownloadProgressTracker(board);
+  }
+}
+
+async function downloadLoader(board, browser, page, generateButton) {
   board.setDetail("generate", formatDownloadDetail(0, 0));
 
   const generate = generateButton || page.getByText(/generate loader/i).first();
@@ -736,23 +860,21 @@ async function downloadLoader(board, context, page, generateButton) {
     await generate.waitFor({ state: "visible", timeout: GENERATE_TIMEOUT_MS });
   }
 
-  const [download] = await Promise.all([
-    page.waitForEvent("download", { timeout: DOWNLOAD_TIMEOUT_MS }),
-    generate.click({ timeout: DEFAULT_TIMEOUT_MS }),
-  ]);
-
-  const suggested = path.basename(download.suggestedFilename() || "loader.exe");
-  const targetPath = path.join(DOWNLOAD_DIR, suggested);
-  const totalBytes = await getDownloadTotalBytes(context, download);
-  const progress = trackDownloadProgress(board, targetPath, totalBytes);
-
+  const progress = await createDownloadProgressTracker(board, browser);
   try {
-    await download.saveAs(targetPath);
-  } finally {
-    progress.finish();
-  }
+    const [download] = await Promise.all([
+      page.waitForEvent("download", { timeout: DOWNLOAD_TIMEOUT_MS }),
+      generate.click({ timeout: DEFAULT_TIMEOUT_MS }),
+    ]);
 
-  return targetPath;
+    const suggested = path.basename(download.suggestedFilename() || "loader.exe");
+    const targetPath = path.join(DOWNLOAD_DIR, suggested);
+    await download.saveAs(targetPath);
+    progress.finish(fileSize(targetPath));
+    return targetPath;
+  } finally {
+    progress.stop();
+  }
 }
 
 function cleanKeyTimeValue(value) {
@@ -1353,7 +1475,6 @@ async function main() {
     // work and see exactly where it stops.
     const automation = await createAutomationPage({ acceptDownloads: true });
     browser = automation.browser;
-    const context = automation.context;
     const page = automation.page;
     const keyField = page.locator("#serialNumber");
 
@@ -1387,7 +1508,7 @@ async function main() {
       .catch(() => updateHeaderKeyTime("not shown by site"));
 
     // 3) Click "Generate Loader" and capture the download it triggers.
-    const savePath = await downloadLoader(board, context, page, generateButton);
+    const savePath = await downloadLoader(board, browser, page, generateButton);
     board.complete("generate");
 
     if (!SHOW_BROWSER) {
