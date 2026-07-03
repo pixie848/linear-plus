@@ -412,11 +412,11 @@ const CHARCOAL_END = [188, 193, 205];
 // COPY KEY while a key is being entered, and later shows the key time.
 const TOP_GAP = 1;
 const LINEAR_HEIGHT = LINEAR_ART.split(/\r?\n/).length;
-// 1 starts the next block immediately after LINEAR.PUB; 3 leaves two blank rows.
-const AFTER_LINEAR_GAP = 3;
+// Keep the key/time art visually centred between LINEAR.PUB and the text below.
+const HEADER_BLOCK_GAP = 2;
 const TIME_HEIGHT = HEADER_PIXEL_HEIGHT;
-const TIME_ROW = TOP_GAP + LINEAR_HEIGHT + AFTER_LINEAR_GAP;
-const CONTENT_ROW = TIME_ROW + TIME_HEIGHT + 1;
+const TIME_ROW = TOP_GAP + LINEAR_HEIGHT + HEADER_BLOCK_GAP + 1;
+const CONTENT_ROW = TIME_ROW + TIME_HEIGHT + HEADER_BLOCK_GAP;
 const DEFAULT_TERM_COLUMNS = 82;
 
 function color(text, ansiColor) {
