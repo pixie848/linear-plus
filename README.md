@@ -10,19 +10,19 @@ After downloading, it launches the downloaded `.exe` automatically.
 
 Double-click `Get Loader.bat`.
 
-On the first run it checks Node.js, `node_modules`, and Playwright Chromium.
-Anything already installed is skipped, and anything missing is installed before
-the loader starts.
+Normal launches use quick Node.js, `node_modules`, and browser-cache checks,
+then start the loader immediately. If setup files are missing, it installs only
+the missing pieces before the loader starts.
 
 ## Add your key
 
-Open `keys.txt` and put exactly one line in it: `*` followed immediately by
-your real 50-character letters/numbers key.
+Open `keys.txt` and put exactly one line in it: your real 50-character
+letters/numbers key. No leading `*` is needed.
 
 Do not add comments, examples, or extra old keys.
 
 If `keys.txt` is empty or missing, the script asks for your key once, saves it
-as the current `*` key, and then future runs are automatic. Invalid text is
+as the current key, and then future runs are automatic. Invalid text is
 rejected until a real 50-character key is entered.
 
 

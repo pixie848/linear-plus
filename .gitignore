@@ -1,7 +1,8 @@
-node_modules/
+.browser-profile/
+.linear-setup-ready
 downloads/
 keys.txt
-.linear-setup-ready
+node_modules/
 
 *.exe
 *.log

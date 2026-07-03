@@ -15,19 +15,24 @@ const { chromium } = require("playwright");
 
 const SITE_URL = "https://launcher.linear.pub/";
 const KEYS_FILE = path.join(__dirname, "keys.txt");
+const BROWSER_PROFILE_DIR = path.join(__dirname, ".browser-profile");
 const DOWNLOAD_DIR = path.join(__dirname, "downloads");
 const DIAGNOSTICS_DIR = path.join(DOWNLOAD_DIR, "diagnostics");
 const SHOW_BROWSER = envFlag("LINEAR_SHOW_BROWSER");
 const RUN_DOWNLOADED = !envFlag("LINEAR_NO_RUN");
 const DEFAULT_TIMEOUT_MS = 15000;
-const OPTIONAL_CONTINUE_TIMEOUT_MS = 1500;
-const OPTIONAL_CONTINUE_TEXT_TIMEOUT_MS = 1000;
+const FAST_ACTION_TIMEOUT_MS = 300;
+const OPTIONAL_CONTINUE_TIMEOUT_MS = 350;
+const OPTIONAL_CONTINUE_TEXT_TIMEOUT_MS = 250;
 const GENERATE_TIMEOUT_MS = 30000;
+const KEY_SUBMIT_RETRY_MS = 150;
+const HYDRATED_SUBMIT_FALLBACK_MS = 600;
 const DOWNLOAD_TIMEOUT_MS = 120000;
+const DOWNLOAD_RECOVERY_TIMEOUT_MS = 10000;
 const KEY_TIME_READ_TIMEOUT_MS = 250;
 const STATUS_TICK_MS = 120;
 const PROMPT_SHIMMER_TICK_MS = 90;
-const SUCCESS_EXIT_SECONDS = 10;
+const SUCCESS_EXIT_SECONDS = 0;
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const KEY_LENGTH = 50;
 const KEY_PATTERN = /^[A-Za-z0-9]{50}$/;
@@ -49,10 +54,89 @@ const DURATION_PATTERN = new RegExp(
 );
 const CLOCK_PATTERN = /\b\d{1,2}:\d{2}(?::\d{2})?\b/g;
 
-// "ANSI Shadow" 3D block font. Only the characters used by the two banners
-// (LINEAR.PUB and ENTER KEY) are included.
+// "ANSI Shadow" 3D block font. Includes the banner, copy prompt, and key time.
 const SHADOW_HEIGHT = 6;
 const SHADOW_LETTERS = {
+  "0": [
+    " ███╗ ",
+    "██╔██╗",
+    "██║██║",
+    "██║██║",
+    "╚███╔╝",
+    " ╚══╝ ",
+  ],
+  "1": [
+    " ██╗  ",
+    "███║  ",
+    "╚██║  ",
+    " ██║  ",
+    "█████╗",
+    "╚════╝",
+  ],
+  "2": [
+    "████╗ ",
+    "╚══██╗",
+    " ███╔╝",
+    "██╔══╝",
+    "█████╗",
+    "╚════╝",
+  ],
+  "3": [
+    "████╗ ",
+    "╚══██╗",
+    " ███╔╝",
+    " ╚═██╗",
+    "████╔╝",
+    "╚═══╝ ",
+  ],
+  "4": [
+    "██╗██╗",
+    "██║██║",
+    "█████║",
+    "╚══██║",
+    "   ██║",
+    "   ╚═╝",
+  ],
+  "5": [
+    "█████╗",
+    "██╔══╝",
+    "████╗ ",
+    "╚══██╗",
+    "████╔╝",
+    "╚═══╝ ",
+  ],
+  "6": [
+    " ███╗ ",
+    "██╔══╝",
+    "████╗ ",
+    "██╔██╗",
+    "╚███╔╝",
+    " ╚══╝ ",
+  ],
+  "7": [
+    "█████╗",
+    "╚══██║",
+    "   ██║",
+    "  ██╔╝",
+    "  ██║ ",
+    "  ╚═╝ ",
+  ],
+  "8": [
+    " ███╗ ",
+    "██╔██╗",
+    "╚███╔╝",
+    "██╔██╗",
+    "╚███╔╝",
+    " ╚══╝ ",
+  ],
+  "9": [
+    " ███╗ ",
+    "██╔██╗",
+    "╚████║",
+    " ╚═██║",
+    " ███╔╝",
+    " ╚══╝ ",
+  ],
   A: [
     " █████╗ ",
     "██╔══██╗",
@@ -69,6 +153,22 @@ const SHADOW_LETTERS = {
     "██████╔╝",
     "╚═════╝ ",
   ],
+  C: [
+    " ██████╗",
+    "██╔════╝",
+    "██║     ",
+    "██║     ",
+    "╚██████╗",
+    " ╚═════╝",
+  ],
+  D: [
+    "██████╗ ",
+    "██╔══██╗",
+    "██║  ██║",
+    "██║  ██║",
+    "██████╔╝",
+    "╚═════╝ ",
+  ],
   E: [
     "███████╗",
     "██╔════╝",
@@ -76,6 +176,14 @@ const SHADOW_LETTERS = {
     "██╔══╝  ",
     "███████╗",
     "╚══════╝",
+  ],
+  H: [
+    "██╗  ██╗",
+    "██║  ██║",
+    "███████║",
+    "██╔══██║",
+    "██║  ██║",
+    "╚═╝  ╚═╝",
   ],
   I: [
     "██╗",
@@ -101,6 +209,14 @@ const SHADOW_LETTERS = {
     "███████╗",
     "╚══════╝",
   ],
+  M: [
+    "███╗   ███╗",
+    "████╗ ████║",
+    "██╔████╔██║",
+    "██║╚██╔╝██║",
+    "██║ ╚═╝ ██║",
+    "╚═╝     ╚═╝",
+  ],
   N: [
     "███╗   ██╗",
     "████╗  ██║",
@@ -108,6 +224,14 @@ const SHADOW_LETTERS = {
     "██║╚██╗██║",
     "██║ ╚████║",
     "╚═╝  ╚═══╝",
+  ],
+  O: [
+    " █████╗ ",
+    "██╔══██╗",
+    "██║  ██║",
+    "██║  ██║",
+    "╚█████╔╝",
+    " ╚════╝ ",
   ],
   P: [
     "██████╗ ",
@@ -173,8 +297,7 @@ function makeLetterArt(text) {
   return rows.map((row) => row.replace(/\s+$/, "")).join("\n");
 }
 
-// A compact solid-block font (same block style as the banner, half-height) for
-// the key-time line and the ENTER KEY prompt.
+// Legacy compact solid-block font, kept available if a smaller prompt is needed.
 const SMALL_HEIGHT = 3;
 const SMALL_LETTERS = {
   "0": ["█▀█", "█ █", "▀▀▀"],
@@ -217,10 +340,16 @@ function makeSmallArt(text) {
 }
 
 const LINEAR_ART = makeLetterArt("LINEAR.PUB");
+const LINEAR_WIDTH = Math.max(
+  ...LINEAR_ART.split(/\r?\n/).map((line) => [...line].length)
+);
 
 // A gentle blue-to-blue gradient used by the time block, stars and accents.
 const BANNER_GRADIENT_START = [105, 170, 255];
 const BANNER_GRADIENT_END = [40, 100, 235];
+// A red gradient used for rejected-key feedback.
+const REJECT_GRADIENT_START = [255, 125, 125];
+const REJECT_GRADIENT_END = [215, 25, 70];
 // "LINEAR." is drawn in white; "PUB" in one solid blue (no gradient).
 const LINEAR_WHITE = [240, 242, 248];
 const PUB_BLUE = [0, 76, 200];
@@ -234,11 +363,13 @@ const CHARCOAL_END = [188, 193, 205];
 
 // Layout rows (1-indexed). We clear the screen and draw from the top, so these
 // stay fixed and can be rewritten in place. The time zone starts blank, hosts
-// ENTER KEY while a key is being entered, and later shows the key time.
+// COPY KEY while a key is being entered, and later shows the key time.
 const TOP_GAP = 1;
 const LINEAR_HEIGHT = LINEAR_ART.split(/\r?\n/).length;
-const TIME_HEIGHT = SMALL_HEIGHT;
-const TIME_ROW = TOP_GAP + LINEAR_HEIGHT + 2;
+// 1 starts the next block immediately after LINEAR.PUB; 3 leaves two blank rows.
+const AFTER_LINEAR_GAP = 3;
+const TIME_HEIGHT = SHADOW_HEIGHT;
+const TIME_ROW = TOP_GAP + LINEAR_HEIGHT + AFTER_LINEAR_GAP;
 const CONTENT_ROW = TIME_ROW + TIME_HEIGHT + 1;
 const DEFAULT_TERM_COLUMNS = 82;
 
@@ -340,10 +471,20 @@ function centeredSmallArtLines(text) {
   return centerArt(raw, bannerGradient(raw)).split(/\r?\n/);
 }
 
+function centeredHeaderArtLines(text) {
+  const raw = makeLetterArt(text);
+  return centerArt(raw, bannerGradient(raw)).split(/\r?\n/);
+}
+
+function contentWidth() {
+  const available = Math.max(1, termWidth() - 2);
+  return Math.max(STATUS_DOT_COLUMN + 1, Math.min(available, LINEAR_WIDTH));
+}
+
 // Shared left margin for the text block (key line, statuses, prompt) so the
-// whole group sits centred in the window.
+// whole group fills the banner width and sits centred in the window.
 function contentMargin() {
-  return Math.max(0, Math.floor((termWidth() - (STATUS_DOT_COLUMN + 1)) / 2));
+  return Math.max(0, Math.floor((termWidth() - contentWidth()) / 2));
 }
 
 function contentPad() {
@@ -354,11 +495,20 @@ function gradientColorAt(amount) {
   return blendColor(BANNER_GRADIENT_START, BANNER_GRADIENT_END, clamp(amount, 0, 1));
 }
 
+function rejectGradientColorAt(amount) {
+  return blendColor(REJECT_GRADIENT_START, REJECT_GRADIENT_END, clamp(amount, 0, 1));
+}
+
 // A "*" tinted along the blue banner gradient by its position in the key, so a
 // pasted/typed key shows up as a blue gradient instead of plain white stars.
-function maskStar(index) {
-  const amount = KEY_LENGTH <= 1 ? 0 : index / (KEY_LENGTH - 1);
+function maskStar(index, length = KEY_LENGTH) {
+  const amount = length <= 1 ? 0 : index / (length - 1);
   return colorRgb("*", gradientColorAt(amount));
+}
+
+function rejectMaskStar(index, length = KEY_LENGTH) {
+  const amount = length <= 1 ? 0 : index / (length - 1);
+  return colorRgb("*", rejectGradientColorAt(amount));
 }
 
 // A "*" whose colour drifts back and forth through the gradient to shimmer.
@@ -367,18 +517,26 @@ function shimmerStar(frame) {
   return colorRgb("*", gradientColorAt(amount));
 }
 
+function rejectShimmerStar(frame) {
+  const amount = (Math.sin(frame * 0.35) + 1) / 2;
+  return colorRgb("*", rejectGradientColorAt(amount));
+}
+
 // Retract the row of key stars back into the prompt star, like it worms in.
-async function animateStarsRetract(count) {
+async function animateStarsRetract(count, options = {}) {
   if (!canMoveCursor()) {
     return;
   }
 
   const pad = contentPad();
+  const starCount = Math.max(1, Math.min(KEY_LENGTH, Math.trunc(count) || 0));
+  const promptStar = options.reject ? rejectShimmerStar : shimmerStar;
+  const rowStar = options.reject ? rejectMaskStar : maskStar;
 
-  for (let remaining = count; remaining > 0; remaining -= 3) {
-    let line = `${pad}${shimmerStar(remaining)} `;
+  for (let remaining = starCount; remaining > 0; remaining -= 3) {
+    let line = `${pad}${promptStar(remaining)} `;
     for (let i = 0; i < remaining; i += 1) {
-      line += maskStar(i);
+      line += rowStar(i, starCount);
     }
     process.stdout.cursorTo(0);
     process.stdout.clearLine(0);
@@ -425,6 +583,11 @@ async function printFinishedBanner() {
   console.log();
   const pad = contentPad();
 
+  if (SUCCESS_EXIT_SECONDS <= 0) {
+    writeStatusLine(pad + bannerGradient("finished, closing now"), true);
+    return;
+  }
+
   for (let remaining = SUCCESS_EXIT_SECONDS; remaining > 0; remaining -= 1) {
     writeStatusLine(pad + bannerGradient(`finished, closing in ${remaining} seconds`));
     await sleep(1000);
@@ -446,6 +609,43 @@ async function closeBrowserQuietly(browser) {
     await browser.close();
   } catch {
     // The process is already finished or closing.
+  }
+}
+
+let activeBrowser = null;
+let cancellationStarted = false;
+
+function trackBrowserClose(browser) {
+  return closeBrowserQuietly(browser).finally(() => {
+    if (activeBrowser === browser) {
+      activeBrowser = null;
+    }
+  });
+}
+
+function installCancellationHandlers() {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(signal, () => {
+      void cancelRun(signal);
+    });
+  }
+}
+
+async function cancelRun(signal) {
+  if (cancellationStarted) {
+    process.exit(130);
+  }
+
+  cancellationStarted = true;
+  showCursor();
+
+  try {
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\n${color(`cancelled by ${signal}, closing...`, ANSI.red)}\n`);
+    }
+    await closeBrowserQuietly(activeBrowser);
+  } finally {
+    process.exit(130);
   }
 }
 
@@ -527,11 +727,13 @@ async function blockHeavyResources(page) {
 }
 
 async function createAutomationPage(options = {}) {
-  const browser = await chromium.launch(getBrowserLaunchOptions());
-  const context = await browser.newContext({
+  const context = await chromium.launchPersistentContext(BROWSER_PROFILE_DIR, {
+    ...getBrowserLaunchOptions(),
     acceptDownloads: options.acceptDownloads !== false,
   });
-  const page = await context.newPage();
+  const browser = context.browser() || context;
+  const pages = context.pages();
+  const page = pages[0] || (await context.newPage());
   page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
   await blockHeavyResources(page);
 
@@ -602,7 +804,7 @@ function drawTimeZone(lines) {
   process.stdout.write("\x1b[u");
 }
 
-// Show the key time as small art ("17D 20H 30M"). Until the site reports a
+// Show the key time as banner art ("17D 20H 30M"). Until the site reports a
 // parsable time, the zone simply stays empty - no placeholder dashes.
 function updateHeaderKeyTime(timeLeft) {
   const dhm = extractDHM(timeLeft);
@@ -610,7 +812,7 @@ function updateHeaderKeyTime(timeLeft) {
     return;
   }
 
-  drawTimeZone(centeredSmallArtLines(`${dhm.d}D ${dhm.h}H ${dhm.m}M`));
+  drawTimeZone(centeredHeaderArtLines(`${dhm.d}D ${dhm.h}H ${dhm.m}M`));
 }
 
 const STATUS_STEPS = [
@@ -621,6 +823,7 @@ const STATUS_STEPS = [
 ];
 const STATUS_SPEED_WIDTH = 9;
 const STATUS_LABEL_WIDTH = Math.max(...STATUS_STEPS.map((step) => step.label.length));
+const STATUS_ROW_GAP = 1;
 // The column every dot lines up on: "status: " + widest label + " " + "100%" +
 // " " + speed field + one space before the dot.
 const STATUS_DOT_COLUMN =
@@ -664,6 +867,8 @@ function createStatusBoard() {
   const steps = STATUS_STEPS.map((step) => ({ ...step, done: false, detail: "" }));
   const useCursor = canMoveCursor();
   const margin = contentMargin();
+  const dotColumn = contentWidth() - 1;
+  const boardHeight = steps.length + STATUS_ROW_GAP * Math.max(0, steps.length - 1);
 
   function lineFor(step) {
     // Charcoal-metallic label; the live detail and dot keep their own colours.
@@ -671,16 +876,21 @@ function createStatusBoard() {
     if (step.detail) {
       preDot += ` ${step.detail}`;
     }
-    return `${padVisibleEnd(preDot, margin + STATUS_DOT_COLUMN)}${statusDot(step.done)}`;
+    return `${padVisibleEnd(preDot, margin + dotColumn)}${statusDot(step.done)}`;
   }
 
   function redraw() {
-    process.stdout.write(`\x1b[${steps.length}A`);
-    for (const step of steps) {
+    process.stdout.write(`\x1b[${boardHeight}A`);
+    steps.forEach((step, index) => {
       process.stdout.cursorTo(0);
       process.stdout.clearLine(0);
       process.stdout.write(`${lineFor(step)}\n`);
-    }
+      for (let gap = 0; gap < STATUS_ROW_GAP && index < steps.length - 1; gap += 1) {
+        process.stdout.cursorTo(0);
+        process.stdout.clearLine(0);
+        process.stdout.write("\n");
+      }
+    });
   }
 
   function update(key, changes) {
@@ -698,9 +908,12 @@ function createStatusBoard() {
     }
   }
 
-  for (const step of steps) {
+  steps.forEach((step, index) => {
     console.log(lineFor(step));
-  }
+    for (let gap = 0; gap < STATUS_ROW_GAP && index < steps.length - 1; gap += 1) {
+      console.log();
+    }
+  });
 
   return {
     setDetail(key, detail) {
@@ -730,6 +943,70 @@ function fileSize(filePath) {
 function averageSpeed(bytes, startedAt) {
   const seconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
   return bytes / seconds;
+}
+
+async function waitForStableDownloadFile(filePath, options = {}) {
+  const timeoutMs = options.timeoutMs || DOWNLOAD_RECOVERY_TIMEOUT_MS;
+  const minMtimeMs = options.minMtimeMs || 0;
+  const started = Date.now();
+  let lastSize = -1;
+  let stableTicks = 0;
+
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.isFile() && stat.size > 0 && stat.mtimeMs >= minMtimeMs) {
+        if (stat.size === lastSize) {
+          stableTicks += 1;
+        } else {
+          stableTicks = 0;
+          lastSize = stat.size;
+        }
+
+        if (stableTicks >= 2) {
+          return filePath;
+        }
+      }
+    } catch {
+      // The browser may still be renaming the download into place.
+    }
+
+    await sleep(100);
+  }
+
+  return "";
+}
+
+async function findRecoveredDownload(suggestedName, startedAt, options = {}) {
+  const timeoutMs = options.timeoutMs || DOWNLOAD_RECOVERY_TIMEOUT_MS;
+  const targetPath = path.join(DOWNLOAD_DIR, suggestedName);
+  const exactPath = await waitForStableDownloadFile(targetPath, {
+    timeoutMs,
+    minMtimeMs: startedAt - 1000,
+  });
+  if (exactPath) {
+    return exactPath;
+  }
+
+  let candidates = [];
+  try {
+    candidates = fs
+      .readdirSync(DOWNLOAD_DIR)
+      .filter((name) => /\.exe$/i.test(name))
+      .map((name) => path.join(DOWNLOAD_DIR, name))
+      .filter((filePath) => fs.statSync(filePath).mtimeMs >= startedAt - 1000);
+  } catch {
+    return "";
+  }
+
+  if (candidates.length !== 1) {
+    return "";
+  }
+
+  return waitForStableDownloadFile(candidates[0], {
+    timeoutMs,
+    minMtimeMs: startedAt - 1000,
+  });
 }
 
 function estimateUnknownDownloadPercent(receivedBytes, startedAt) {
@@ -921,6 +1198,7 @@ async function downloadLoader(board, browser, page, generateButton) {
 
   const progress = await createDownloadProgressTracker(board, browser);
   try {
+    const downloadStartedAt = Date.now();
     const [download] = await Promise.all([
       page.waitForEvent("download", { timeout: DOWNLOAD_TIMEOUT_MS }),
       generate.click({ timeout: DEFAULT_TIMEOUT_MS }),
@@ -928,9 +1206,27 @@ async function downloadLoader(board, browser, page, generateButton) {
 
     const suggested = path.basename(download.suggestedFilename() || "loader.exe");
     const targetPath = path.join(DOWNLOAD_DIR, suggested);
-    await download.saveAs(targetPath);
-    progress.finish(fileSize(targetPath));
-    return targetPath;
+    const existingPath = await findRecoveredDownload(suggested, downloadStartedAt, {
+      timeoutMs: 350,
+    });
+    if (existingPath) {
+      progress.finish(fileSize(existingPath));
+      return existingPath;
+    }
+
+    try {
+      await download.saveAs(targetPath);
+      progress.finish(fileSize(targetPath));
+      return targetPath;
+    } catch (err) {
+      const recoveredPath = await findRecoveredDownload(suggested, downloadStartedAt);
+      if (recoveredPath) {
+        progress.finish(fileSize(recoveredPath));
+        return recoveredPath;
+      }
+
+      throw err;
+    }
   } finally {
     progress.stop();
   }
@@ -1045,18 +1341,126 @@ function maskKey(key) {
   return key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : "(short key)";
 }
 
-async function waitForGenerateAfterKey(page, generateButton, key) {
+async function clickContinueButton(page) {
+  try {
+    await page.getByRole("button", { name: /continue/i }).first().click({
+      timeout: OPTIONAL_CONTINUE_TIMEOUT_MS,
+    });
+    return true;
+  } catch {
+    try {
+      await page.getByText(/^continue$/i).first().click({
+        timeout: OPTIONAL_CONTINUE_TEXT_TIMEOUT_MS,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function hasSerialField(keyField) {
+  return (await keyField.count().catch(() => 0)) > 0;
+}
+
+async function fillKeyFieldFast(page, keyField, key) {
+  try {
+    await keyField.fill(key, { timeout: FAST_ACTION_TIMEOUT_MS });
+    return true;
+  } catch {
+    // The server-rendered textarea can exist before Playwright considers it
+    // fillable; set it directly and let the retry click submit once hydrated.
+  }
+
+  return page
+    .evaluate((serial) => {
+      const field = document.querySelector("#serialNumber");
+      if (!field) {
+        return false;
+      }
+
+      const descriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(field),
+        "value"
+      );
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(field, serial);
+      } else {
+        field.value = serial;
+      }
+
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+      field.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }, key)
+    .catch(() => false);
+}
+
+async function isContinueHydrated(page) {
+  return page
+    .evaluate(() => {
+      const hasReactState = (element) =>
+        Boolean(
+          element &&
+            Object.keys(element).some(
+              (key) => key.startsWith("__reactProps$") || key.startsWith("__reactFiber$")
+            )
+        );
+      const button = [...document.querySelectorAll("button")].find((candidate) =>
+        /^continue$/i.test((candidate.textContent || "").trim())
+      );
+      const form = button ? button.closest("form") : document.querySelector("form");
+      const field = document.querySelector("#serialNumber");
+      return hasReactState(button) || hasReactState(form) || hasReactState(field);
+    })
+    .catch(() => false);
+}
+
+async function waitForGenerateAfterKey(page, keyField, generateButton, key) {
   const started = Date.now();
+  let submitAttempts = 0;
 
   while (Date.now() - started < GENERATE_TIMEOUT_MS) {
     if (await generateButton.isVisible().catch(() => false)) {
       return;
     }
 
+    const keyFieldReady = await hasSerialField(keyField);
+    const continueVisible = await page
+      .getByRole("button", { name: /continue/i })
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const continueTextVisible = continueVisible
+      ? true
+      : await page
+          .getByText(/^continue$/i)
+          .first()
+          .isVisible()
+          .catch(() => false);
+
+    if (keyFieldReady) {
+      await fillKeyFieldFast(page, keyField, key);
+      const canSubmit =
+        continueVisible || continueTextVisible
+          ? (await isContinueHydrated(page)) ||
+            Date.now() - started >= HYDRATED_SUBMIT_FALLBACK_MS
+          : false;
+      if (canSubmit && (await clickContinueButton(page))) {
+        submitAttempts += 1;
+      }
+      await page.waitForTimeout(KEY_SUBMIT_RETRY_MS);
+      continue;
+    }
+
     await page.waitForTimeout(100);
   }
 
-  let message = "Generate Loader did not appear after submitting the key. Check keys.txt and try again.";
+  let message =
+    "Generate Loader did not appear after submitting the key. Check keys.txt and try again.";
+  if (submitAttempts > 1) {
+    message += `\n\nThe page was still showing the serial-number form after ${submitAttempts} submit attempts.`;
+  }
   try {
     const diagnostics = await writeFailureDiagnostics(page, key, "Generate Loader button was not visible after key submit.");
     message +=
@@ -1133,6 +1537,10 @@ function findKeyInText(text) {
 }
 
 function readClipboardText() {
+  return readClipboardSnapshot().text;
+}
+
+function readClipboardTextOnly() {
   if (process.platform !== "win32") {
     return "";
   }
@@ -1153,9 +1561,47 @@ function readClipboardText() {
   }
 }
 
+function readClipboardSnapshot() {
+  if (process.platform !== "win32") {
+    return { text: "", sequence: 0 };
+  }
+
+  try {
+    const output = execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        "$sig='[DllImport(\"user32.dll\")] public static extern uint GetClipboardSequenceNumber();'; " +
+          "$native=Add-Type -MemberDefinition $sig -Name ClipboardSequence -Namespace Win32 -PassThru; " +
+          "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " +
+          "[Console]::WriteLine($native::GetClipboardSequenceNumber()); " +
+          "[Console]::Write((Get-Clipboard -Raw))",
+      ],
+      {
+        encoding: "utf8",
+        timeout: 2000,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      }
+    );
+    const firstBreak = output.indexOf("\n");
+    if (firstBreak === -1) {
+      return { text: "", sequence: Number(output.trim()) || 0 };
+    }
+
+    return {
+      text: output.slice(firstBreak + 1),
+      sequence: Number(output.slice(0, firstBreak).trim()) || 0,
+    };
+  } catch {
+    return { text: readClipboardTextOnly(), sequence: 0 };
+  }
+}
+
 function saveCurrentKey(key) {
   const cleanKey = normalizeEnteredKey(key);
-  fs.writeFileSync(KEYS_FILE, `*${cleanKey}\r\n`);
+  fs.writeFileSync(KEYS_FILE, `${cleanKey}\r\n`);
 }
 
 function askLine(query) {
@@ -1187,17 +1633,18 @@ function askKeyPaste() {
     let clipboardTimer = null;
     let pendingPasteText = "";
     let shimmerFrame = 0;
+    let rejectingText = false;
+    let promptRejected = false;
+    let lastClipboardSequence = 0;
+    let lastClipboardFingerprint = "";
 
-    // Redraw the whole prompt line: a shimmering blue "*" prompt, one
-    // gradient-blue "*" per entered character, and a soft block caret (the
-    // hardware cursor is hidden, so this is the only cursor you see).
-    function renderPrompt(showCaret = true) {
-      let line = `${pad}${shimmerStar(shimmerFrame)} `;
+    // Redraw the whole prompt line: the prompt "*" stays red after a rejection,
+    // while entered characters keep the blue key gradient.
+    function renderPrompt() {
+      const promptStar = promptRejected ? rejectShimmerStar : shimmerStar;
+      let line = `${pad}${promptStar(shimmerFrame)} `;
       for (let i = 0; i < value.length; i += 1) {
         line += maskStar(i);
-      }
-      if (showCaret && value.length < KEY_LENGTH) {
-        line += colorRgb("▁", gradientColorAt(value.length / (KEY_LENGTH - 1)));
       }
 
       if (process.stdout.cursorTo && process.stdout.clearLine) {
@@ -1210,7 +1657,7 @@ function askKeyPaste() {
     }
 
     const shimmerTimer = setInterval(() => {
-      if (finished) {
+      if (finished || rejectingText) {
         return;
       }
       shimmerFrame += 1;
@@ -1231,7 +1678,7 @@ function askKeyPaste() {
         clearInterval(clipboardTimer);
       }
       if (!error) {
-        renderPrompt(false);
+        renderPrompt();
       }
       stdin.off("data", onData);
       stdin.setRawMode(Boolean(wasRaw));
@@ -1241,16 +1688,7 @@ function askKeyPaste() {
       if (error) {
         reject(error);
       } else {
-        resolve(answer);
-      }
-    }
-
-    function appendText(text) {
-      const cleanText = String(text || "").replace(/\s+/g, "");
-      for (const char of cleanText) {
-        if (/^[A-Za-z0-9]$/.test(char)) {
-          value += char;
-        }
+        resolve({ value: answer, promptRejected });
       }
     }
 
@@ -1260,33 +1698,103 @@ function askKeyPaste() {
         return false;
       }
 
+      promptRejected = false;
       value = key;
       finish(value);
       return true;
     }
 
+    function rejectedFingerprint(text) {
+      return String(text || "").replace(/\0/g, "").trim();
+    }
+
+    function rejectedStarCount(text) {
+      const compactText = rejectedFingerprint(text).replace(/\s+/g, "");
+      return Math.max(1, Math.min(KEY_LENGTH, compactText.length));
+    }
+
+    async function showRejectedText(text) {
+      if (finished || rejectingText) {
+        return;
+      }
+
+      const fingerprint = rejectedFingerprint(text);
+      if (!fingerprint) {
+        renderPrompt();
+        return;
+      }
+
+      promptRejected = true;
+      rejectingText = true;
+      value = "";
+      pendingPasteText = "";
+      if (pasteTimer) {
+        clearTimeout(pasteTimer);
+        pasteTimer = null;
+      }
+
+      await animateStarsRetract(rejectedStarCount(text), { reject: true });
+
+      rejectingText = false;
+      if (!finished) {
+        renderPrompt();
+      }
+    }
+
     function finishPastedText(text) {
+      const rawText = String(text || "");
+
       const candidate = cleanPastedKeyText(text);
       if (acceptKey(candidate)) {
         return;
       }
 
-      value = candidate;
-      finish(value);
+      if (rawText.replace(/\0/g, "").trim()) {
+        void showRejectedText(candidate || rawText);
+      } else {
+        renderPrompt();
+      }
     }
 
     function checkClipboardForKey() {
-      if (finished) {
+      if (finished || rejectingText) {
         return;
       }
 
-      const key = findKeyInText(readClipboardText());
+      const snapshot = readClipboardSnapshot();
+      const clipboardText = snapshot.text;
+      const clipboardFingerprint = rejectedFingerprint(clipboardText);
+      if (!clipboardFingerprint) {
+        return;
+      }
+
+      if (snapshot.sequence) {
+        if (snapshot.sequence === lastClipboardSequence) {
+          return;
+        }
+        lastClipboardSequence = snapshot.sequence;
+      } else if (clipboardFingerprint === lastClipboardFingerprint) {
+        return;
+      } else {
+        lastClipboardFingerprint = clipboardFingerprint;
+      }
+
+      const key = findKeyInText(clipboardText);
       if (key) {
         acceptKey(key);
+        return;
+      }
+
+      if (!value) {
+        void showRejectedText(clipboardText);
       }
     }
 
     function schedulePasteFinish(text) {
+      if (rejectingText) {
+        return;
+      }
+
       pendingPasteText += text;
       if (pasteTimer) {
         clearTimeout(pasteTimer);
@@ -1309,12 +1817,16 @@ function askKeyPaste() {
         return;
       }
 
+      if (rejectingText) {
+        return;
+      }
+
       text = text.replace(/\x1b\[200~([\s\S]*?)\x1b\[201~/g, (_match, pasted) => {
         finishPastedText(findKeyInText(pasted) || pasted);
         return "";
       });
 
-      if (finished) {
+      if (finished || rejectingText) {
         return;
       }
 
@@ -1333,7 +1845,15 @@ function askKeyPaste() {
 
       for (const char of text) {
         if (char === "\r" || char === "\n") {
-          finish(value);
+          if (acceptKey(value)) {
+            return;
+          }
+
+          if (value) {
+            void showRejectedText(value);
+          } else {
+            renderPrompt();
+          }
           return;
         }
 
@@ -1379,12 +1899,12 @@ async function promptForKey() {
 
   const cursorReady = canMoveCursor();
 
-  // ENTER KEY takes the reserved time zone (same size and spot as the key time
+  // COPY KEY takes the reserved time zone (same size and spot as the key time
   // that replaces it later); the prompt sits on the content row below.
   if (cursorReady) {
-    drawTimeZone(centeredSmallArtLines("ENTER KEY"));
+    drawTimeZone(centeredHeaderArtLines("COPY KEY"));
   } else {
-    console.log(bannerGradient(makeSmallArt("ENTER KEY")));
+    console.log(bannerGradient(makeLetterArt("COPY KEY")));
     console.log();
   }
 
@@ -1397,7 +1917,11 @@ async function promptForKey() {
       process.stdout.clearLine(0);
     }
 
-    const entered = await askKeyPaste();
+    const entry = await askKeyPaste();
+    const entered =
+      entry && typeof entry === "object" && Object.prototype.hasOwnProperty.call(entry, "value")
+        ? entry.value
+        : entry;
     const candidate = cleanPastedKeyText(entered);
 
     if (isValidKeyFormat(candidate)) {
@@ -1417,7 +1941,7 @@ async function promptForKey() {
   }
 
   if (cursorReady) {
-    // ENTER KEY vanishes instantly, then the stars worm back into the prompt
+    // COPY KEY vanishes instantly, then the stars worm back into the prompt
     // right where the "key:" line will sit.
     drawTimeZone(null);
     if (showedInvalid) {
@@ -1520,7 +2044,6 @@ function cleanDownloadsDir() {
 }
 
 async function main() {
-  configureConsole({ quickEdit: true });
   printStartupBanner();
 
   const cliKey = process.argv[2];
@@ -1535,8 +2058,6 @@ async function main() {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   cleanDownloadsDir();
 
-  configureConsole({ quickEdit: false });
-
   // Show the whole checklist up front (every dot red); each dot turns blue as
   // its step actually finishes.
   const board = createStatusBoard();
@@ -1547,35 +2068,19 @@ async function main() {
   try {
     // By default the browser runs hidden in the background. Set
     // LINEAR_SHOW_BROWSER=1 before running to watch it work.
-    const automation = await createAutomationPage({ acceptDownloads: true });
+    const automationPromise = createAutomationPage({ acceptDownloads: true });
+    configureConsole({ quickEdit: false });
+    const automation = await automationPromise;
     browser = automation.browser;
+    activeBrowser = browser;
     const page = automation.page;
     const keyField = page.locator("#serialNumber");
 
-    await page.goto(SITE_URL, { waitUntil: "domcontentloaded" });
+    await page.goto(SITE_URL, { waitUntil: "commit" });
     board.complete("access");
 
-    // 1) Enter the key.
-    await keyField.waitFor({ state: "visible", timeout: GENERATE_TIMEOUT_MS });
-    await keyField.fill(key);
-
-    // 2) Click "Continue" if that step exists (skip quietly if it doesn't).
-    try {
-      await page.getByRole("button", { name: /continue/i }).click({
-        timeout: OPTIONAL_CONTINUE_TIMEOUT_MS,
-      });
-    } catch {
-      try {
-        await page.getByText(/^continue$/i).click({
-          timeout: OPTIONAL_CONTINUE_TEXT_TIMEOUT_MS,
-        });
-      } catch {
-        // Some versions of the page go straight to the generate step.
-      }
-    }
-
     const generateButton = page.getByText(/generate loader/i).first();
-    await waitForGenerateAfterKey(page, generateButton, key);
+    await waitForGenerateAfterKey(page, keyField, generateButton, key);
     board.complete("enterKey");
     readKeyTimeLeft(page)
       .then(updateHeaderKeyTime)
@@ -1586,7 +2091,7 @@ async function main() {
     board.complete("generate");
 
     if (!SHOW_BROWSER) {
-      closeBrowserPromise = closeBrowserQuietly(browser);
+      closeBrowserPromise = trackBrowserClose(browser);
     }
 
     const launched = runDownloaded(savePath);
@@ -1597,7 +2102,7 @@ async function main() {
     if (SHOW_BROWSER) {
       console.log("\nKeeping the browser open for 30 seconds so you can confirm everything finished...");
       await page.waitForTimeout(30000);
-      closeBrowserPromise = closeBrowserQuietly(browser);
+      closeBrowserPromise = trackBrowserClose(browser);
     }
 
     if (launched) {
@@ -1612,11 +2117,14 @@ async function main() {
     }
 
     await closeBrowserPromise;
+    if (activeBrowser === browser) {
+      activeBrowser = null;
+    }
   } catch (err) {
     if (closeBrowserPromise) {
       await closeBrowserPromise;
     } else {
-      await closeBrowserQuietly(browser);
+      await trackBrowserClose(browser);
     }
     throw err;
   }
@@ -1628,10 +2136,12 @@ function showCursor() {
   }
 }
 
+installCancellationHandlers();
+
 main()
   .then(() => {
-    // Force the process to close once everything is done (after the countdown),
-    // even if the browser or a detached handle would otherwise keep it alive.
+    // Force the process to close once everything is done, even if the browser
+    // or a detached handle would otherwise keep it alive.
     showCursor();
     process.exit(process.exitCode || 0);
   })

@@ -40,11 +40,10 @@ if not exist "package.json" exit /b 1
 call :FindNpmPackages
 if not defined NPM_PACKAGES_FOUND exit /b 1
 
-if exist "%SETUP_MARKER%" exit /b 0
-
-call :FindPlaywrightChromium
+call :FindPlaywrightChromiumFast
 if not defined PLAYWRIGHT_CHROMIUM_FOUND exit /b 1
-call :WriteSetupMarker
+
+if not exist "%SETUP_MARKER%" call :WriteSetupMarker
 exit /b 0
 
 :EnsureReady
@@ -117,6 +116,20 @@ exit /b 0
 :FindNpmPackages
 set "NPM_PACKAGES_FOUND="
 if exist "node_modules\playwright\package.json" if exist "node_modules\playwright-core\package.json" set "NPM_PACKAGES_FOUND=1"
+exit /b 0
+
+:FindPlaywrightChromiumFast
+set "PLAYWRIGHT_CHROMIUM_FOUND="
+if exist "%LOCALAPPDATA%\ms-playwright\" (
+  pushd "%LOCALAPPDATA%\ms-playwright" >nul 2>nul
+  if not errorlevel 1 (
+    for /d %%D in (chromium-*) do (
+      if exist "%%~fD\chrome-win\chrome.exe" set "PLAYWRIGHT_CHROMIUM_FOUND=1"
+      if exist "%%~fD\chrome-win64\chrome.exe" set "PLAYWRIGHT_CHROMIUM_FOUND=1"
+    )
+    popd
+  )
+)
 exit /b 0
 
 :FindPlaywrightChromium
