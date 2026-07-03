@@ -574,12 +574,19 @@ async function animateStarsRetract(count, options = {}) {
     return;
   }
 
+  const shouldStop =
+    typeof options.shouldStop === "function" ? options.shouldStop : () => false;
   const pad = contentPad();
   const starCount = Math.max(1, Math.min(KEY_LENGTH, Math.trunc(count) || 0));
   const promptStar = options.reject ? rejectShimmerStar : shimmerStar;
   const rowStar = options.reject ? rejectMaskStar : maskStar;
 
   for (let remaining = starCount; remaining > 0; remaining -= 3) {
+    // Bail without clearing if the key was accepted mid-animation, so we don't
+    // wipe the accepted key that finish() just drew.
+    if (shouldStop()) {
+      return;
+    }
     let line = `${pad}${promptStar(remaining)} `;
     for (let i = 0; i < remaining; i += 1) {
       line += rowStar(i, starCount);
@@ -590,6 +597,9 @@ async function animateStarsRetract(count, options = {}) {
     await sleep(18);
   }
 
+  if (shouldStop()) {
+    return;
+  }
   process.stdout.cursorTo(0);
   process.stdout.clearLine(0);
 }
@@ -1765,7 +1775,10 @@ function askKeyPaste() {
         pasteTimer = null;
       }
 
-      await animateStarsRetract(rejectedStarCount(text), { reject: true });
+      await animateStarsRetract(rejectedStarCount(text), {
+        reject: true,
+        shouldStop: () => finished,
+      });
 
       rejectingText = false;
       if (!finished) {
@@ -1789,12 +1802,28 @@ function askKeyPaste() {
     }
 
     async function checkClipboardForKey() {
-      if (finished || rejectingText) {
+      if (finished) {
         return;
       }
 
       const clipboardText = await readClipboardTextAsync();
-      if (finished || rejectingText) {
+      if (finished) {
+        return;
+      }
+
+      // A real key on the clipboard is accepted immediately -- even mid
+      // rejection animation, and even if the clipboard has not "changed" since
+      // the last read. This is what makes "copy the wrong thing, then copy the
+      // real key" auto-fill the moment the real key lands on the clipboard.
+      const key = findKeyInText(clipboardText);
+      if (key) {
+        acceptKey(key);
+        return;
+      }
+
+      // Everything below only decides whether to animate a rejection of non-key
+      // text, so skip it while a rejection is already playing.
+      if (rejectingText) {
         return;
       }
 
@@ -1803,18 +1832,12 @@ function askKeyPaste() {
         return;
       }
 
-      // Only react when the clipboard content actually changes, so a key we
-      // already handled (or text we already rejected) does not re-trigger.
+      // Only animate when the junk actually changes, so text we already
+      // rejected does not re-trigger the animation on every poll.
       if (clipboardFingerprint === lastClipboardFingerprint) {
         return;
       }
       lastClipboardFingerprint = clipboardFingerprint;
-
-      const key = findKeyInText(clipboardText);
-      if (key) {
-        acceptKey(key);
-        return;
-      }
 
       if (!value) {
         void showRejectedText(clipboardText);
@@ -1830,8 +1853,15 @@ function askKeyPaste() {
       }
       clipboardTimer = setTimeout(async () => {
         clipboardTimer = null;
-        await checkClipboardForKey();
-        scheduleClipboardPoll();
+        try {
+          await checkClipboardForKey();
+        } catch {
+          // Never let a transient clipboard read or draw error kill the poll
+          // loop -- a dead loop would silently stop auto-detecting the key for
+          // the rest of the run, which looks like "nothing happens".
+        } finally {
+          scheduleClipboardPoll();
+        }
       }, CLIPBOARD_POLL_MS);
     }
 
@@ -1937,7 +1967,7 @@ function askKeyPaste() {
     stdin.on("data", onData);
     // Kick off the first read immediately, then keep polling as each read
     // settles so an already-copied key is picked up right away.
-    checkClipboardForKey().then(scheduleClipboardPoll);
+    checkClipboardForKey().catch(() => {}).then(scheduleClipboardPoll);
   });
 }
 
