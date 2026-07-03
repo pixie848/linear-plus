@@ -20,13 +20,6 @@ echo - downloaded loaders
 echo - node_modules and setup files
 echo - keys.txt and the rest of this folder
 echo.
-set /p "CONFIRM=Type UNINSTALL to continue: "
-if /i not "%CONFIRM%"=="UNINSTALL" (
-  echo.
-  echo Uninstall cancelled.
-  pause
-  exit /b 0
-)
 
 echo.
 echo Removing Startup warmup entries...
