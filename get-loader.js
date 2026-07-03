@@ -29,7 +29,8 @@ const SUCCESS_EXIT_SECONDS = 10;
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const KEY_LENGTH = 50;
 const KEY_PATTERN = /^[A-Za-z0-9]{50}$/;
-const PASTE_REJECT_DELAY_MS = 120;
+const PASTE_REJECT_DELAY_MS = 180;
+const CLIPBOARD_POLL_MS = 300;
 
 const ANSI = {
   reset: "\x1b[0m",
@@ -220,7 +221,7 @@ const BANNER_GRADIENT_START = [105, 170, 255];
 const BANNER_GRADIENT_END = [40, 100, 235];
 // "LINEAR." is drawn in white; "PUB" in one solid blue (no gradient).
 const LINEAR_WHITE = [240, 242, 248];
-const PUB_BLUE = [41, 121, 255];
+const PUB_BLUE = [0, 76, 200];
 const LINEAR_PUB_SPLIT = ["L", "I", "N", "E", "A", "R", "."].reduce(
   (total, char) => total + SHADOW_LETTERS[char][0].length,
   0
@@ -904,6 +905,11 @@ function normalizeEnteredKey(key) {
 }
 
 function cleanPastedKeyText(text) {
+  const key = findKeyInText(text);
+  if (key) {
+    return key;
+  }
+
   return normalizeEnteredKey(
     String(text || "")
       .replace(/\0/g, "")
@@ -956,7 +962,7 @@ function readClipboardText() {
 
 function saveCurrentKey(key) {
   const cleanKey = normalizeEnteredKey(key);
-  fs.writeFileSync(KEYS_FILE, `${cleanKey}\r\n`);
+  fs.writeFileSync(KEYS_FILE, `*${cleanKey}\r\n`);
 }
 
 function askLine(query) {
@@ -985,6 +991,8 @@ function askKeyPaste() {
     let value = "";
     let finished = false;
     let pasteTimer = null;
+    let clipboardTimer = null;
+    let pendingPasteText = "";
     let shimmerFrame = 0;
 
     // Redraw the whole prompt line: a shimmering blue "*" prompt, one
@@ -1026,6 +1034,9 @@ function askKeyPaste() {
       if (pasteTimer) {
         clearTimeout(pasteTimer);
       }
+      if (clipboardTimer) {
+        clearInterval(clipboardTimer);
+      }
       if (!error) {
         renderPrompt(false);
       }
@@ -1050,17 +1061,47 @@ function askKeyPaste() {
       }
     }
 
+    function acceptKey(candidate) {
+      const key = normalizeEnteredKey(candidate);
+      if (!isValidKeyFormat(key)) {
+        return false;
+      }
+
+      value = key;
+      finish(value);
+      return true;
+    }
+
     function finishPastedText(text) {
-      appendText(cleanPastedKeyText(text));
+      const candidate = cleanPastedKeyText(text);
+      if (acceptKey(candidate)) {
+        return;
+      }
+
+      value = candidate;
       finish(value);
     }
 
-    function schedulePasteFinish() {
+    function checkClipboardForKey() {
+      if (finished) {
+        return;
+      }
+
+      const key = findKeyInText(readClipboardText());
+      if (key) {
+        acceptKey(key);
+      }
+    }
+
+    function schedulePasteFinish(text) {
+      pendingPasteText += text;
       if (pasteTimer) {
         clearTimeout(pasteTimer);
       }
 
-      pasteTimer = setTimeout(() => finish(value), PASTE_REJECT_DELAY_MS);
+      pasteTimer = setTimeout(() => {
+        finishPastedText(pendingPasteText);
+      }, PASTE_REJECT_DELAY_MS);
     }
 
     function eraseCharacter() {
@@ -1092,6 +1133,11 @@ function askKeyPaste() {
       text = text.replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "");
       const likelyPaste = text.replace(/[\r\n\b\u007f\u0015]/g, "").length > 1;
 
+      if (likelyPaste) {
+        schedulePasteFinish(text);
+        return;
+      }
+
       for (const char of text) {
         if (char === "\r" || char === "\n") {
           finish(value);
@@ -1121,16 +1167,15 @@ function askKeyPaste() {
       }
 
       renderPrompt();
-
-      if (likelyPaste) {
-        schedulePasteFinish();
-      }
     }
 
     renderPrompt();
     stdin.setRawMode(true);
+    configureConsole({ quickEdit: true, pinTopmost: false });
     stdin.resume();
     stdin.on("data", onData);
+    clipboardTimer = setInterval(checkClipboardForKey, CLIPBOARD_POLL_MS);
+    checkClipboardForKey();
   });
 }
 
@@ -1231,18 +1276,20 @@ function runDownloaded(savePath) {
   return true;
 }
 
-// Console hardening for Windows:
-// - Turn off "QuickEdit Mode": a single click in the console starts a text
-//   selection that freezes the program the next time it prints, which can
-//   stall the automation long enough to trip a timeout (and blocks scrolling).
-// - Pin the console window always-on-top.
+// Console hardening for Windows. During key entry, QuickEdit is kept on so
+// right-click paste works. During browser automation, QuickEdit is turned off
+// so an accidental click cannot freeze the console output.
 // Best-effort and silent: if any of it fails we just keep going.
-function configureConsole() {
+function configureConsole(options = {}) {
   if (process.platform !== "win32") {
     return;
   }
 
-  const script = `$s = '[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateFile(string n, uint a, uint sh, IntPtr t, uint c, uint f, IntPtr hh); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int z, uint f);'; $k = Add-Type -MemberDefinition $s -Name ConsoleTweaks -Namespace ConIO -PassThru; $h = $k::CreateFile('CONIN$', [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero); $m = 0; [void]$k::GetConsoleMode($h, [ref]$m); [void]$k::SetConsoleMode($h, (($m -band (-bnot 0x40)) -bor 0x80)); [void]$k::SetWindowPos($k::GetConsoleWindow(), [IntPtr](-1), 0, 0, 0, 0, [uint32]0x0003);`;
+  const quickEdit = options.quickEdit !== false;
+  const pinTopmost = options.pinTopmost !== false;
+  const quickEditValue = quickEdit ? "1" : "0";
+  const topmostValue = pinTopmost ? "1" : "0";
+  const script = `$quickEdit = ${quickEditValue}; $topmost = ${topmostValue}; $s = '[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateFile(string n, uint a, uint sh, IntPtr t, uint c, uint f, IntPtr hh); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int z, uint f);'; $k = Add-Type -MemberDefinition $s -Name ConsoleTweaks -Namespace ConIO -PassThru; $h = $k::CreateFile('CONIN$', [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero); $m = 0; [void]$k::GetConsoleMode($h, [ref]$m); if ($quickEdit) { $m = (($m -bor 0x80) -bor 0x40) } else { $m = (($m -bor 0x80) -band (-bnot 0x40)) }; [void]$k::SetConsoleMode($h, $m); if ($topmost) { [void]$k::SetWindowPos($k::GetConsoleWindow(), [IntPtr](-1), 0, 0, 0, 0, [uint32]0x0003) }`;
 
   try {
     execFileSync(
@@ -1276,7 +1323,7 @@ function cleanDownloadsDir() {
 }
 
 async function main() {
-  configureConsole();
+  configureConsole({ quickEdit: true });
   printStartupBanner();
 
   const cliKey = process.argv[2];
@@ -1291,9 +1338,7 @@ async function main() {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   cleanDownloadsDir();
 
-  // Re-apply right before the automation: leaving raw mode after key entry can
-  // restore a console mode captured before QuickEdit was turned off.
-  configureConsole();
+  configureConsole({ quickEdit: false });
 
   // Show the whole checklist up front (every dot red); each dot turns blue as
   // its step actually finishes.

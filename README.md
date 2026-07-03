@@ -6,19 +6,13 @@ clicks through, and **saves the downloaded loader** into the `downloads/` folder
 
 After downloading, it launches the downloaded `.exe` automatically.
 
-## One-time setup
+## Setup and run
 
-Run:
+Double-click `Get Loader.bat`.
 
-```
-Install Dependencies.bat
-```
-
-It installs Node.js if needed, then installs `node_modules` and Playwright
-Chromium. If something is already installed, it skips that step.
-
-`Get Loader.bat` will also run this setup automatically if Node.js or
-`node_modules` are missing.
+On the first run it checks Node.js, `node_modules`, and Playwright Chromium.
+Anything already installed is skipped, and anything missing is installed before
+the loader starts.
 
 ## Add your key
 
@@ -32,9 +26,7 @@ as the current `*` key, and then future runs are automatic. Invalid text is
 rejected until a real 50-character key is entered.
 
 
-## Run it
-
-Double-click `Get Loader.bat`, or run:
+You can also run:
 
 ```
 node get-loader.js
