@@ -37,7 +37,6 @@ const STATUS_TICK_MS = 120;
 const PROMPT_SHIMMER_TICK_MS = 90;
 const SUCCESS_EXIT_SECONDS = 0;
 const SHOW_BROWSER_HOLD_MS = 300000;
-const EXE_TYPE_EDIT_WINDOW_MS = 2500;
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const KEY_LENGTH = 50;
 const KEY_PATTERN = /^[A-Za-z0-9]{50}$/;
@@ -423,6 +422,13 @@ const HEADER_BLOCK_GAP = 2;
 const TIME_HEIGHT = HEADER_PIXEL_HEIGHT;
 const TIME_ROW = TOP_GAP + LINEAR_HEIGHT + HEADER_BLOCK_GAP + 1;
 const CONTENT_ROW = TIME_ROW + TIME_HEIGHT + HEADER_BLOCK_GAP;
+// The key line sits on CONTENT_ROW; the two spoofer rows sit right under it,
+// then a blank row, then the status board. Keeping these as fixed absolute rows
+// lets the spoofer editor rewrite its lines in place without ever duplicating
+// them, no matter where later output has left the cursor.
+const SPOOFER_ROW = CONTENT_ROW + 1;
+const LIVE_SPOOFER_ROW = CONTENT_ROW + 2;
+const STATUS_BOARD_TOP_ROW = CONTENT_ROW + 4;
 const DEFAULT_TERM_COLUMNS = 82;
 
 function color(text, ansiColor) {
@@ -892,6 +898,10 @@ const STATUS_ROW_GAP = 1;
 const STATUS_DOT_COLUMN =
   "status: ".length + STATUS_LABEL_WIDTH + 1 + 4 + 1 + STATUS_SPEED_WIDTH + 1;
 
+function statusBoardHeight() {
+  return STATUS_STEPS.length + STATUS_ROW_GAP * Math.max(0, STATUS_STEPS.length - 1);
+}
+
 // Pad by visible width, ignoring ANSI colour codes, so coloured cells still align.
 function padVisibleEnd(text, width) {
   const visible = text.replace(/\x1b\[[0-9;]*m/g, "").length;
@@ -931,7 +941,7 @@ function createStatusBoard() {
   const useCursor = canMoveCursor();
   const margin = contentMargin();
   const dotColumn = contentWidth() - 1;
-  const boardHeight = steps.length + STATUS_ROW_GAP * Math.max(0, steps.length - 1);
+  const boardHeight = statusBoardHeight();
 
   function lineFor(step) {
     // Charcoal-metallic label; the live detail and dot keep their own colours.
@@ -1959,6 +1969,66 @@ function formatExeType(exeType) {
   return exeType === "be" ? "BE" : "none";
 }
 
+function spooferChoicePrompt(currentType = "") {
+  const current = currentType ? charcoalGradient(`  current: ${formatExeType(currentType)}`) : "";
+  return [
+    contentPad(),
+    charcoalGradient("spoofer  "),
+    colorRgb("[B]", BANNER_GRADIENT_END),
+    charcoalGradient(" BE   "),
+    colorRgb("[N]", BANNER_GRADIENT_END),
+    charcoalGradient(" none"),
+    current,
+    charcoalGradient(": "),
+  ].join("");
+}
+
+// Rewrite a single fixed layout row in place without disturbing the cursor --
+// the same save / jump / restore trick the time zone uses. Because it targets an
+// absolute row, it never duplicates a line even if other output has since moved
+// the cursor below it.
+function writeAbsoluteLine(row, line) {
+  if (!canMoveCursor()) {
+    return;
+  }
+
+  process.stdout.write("\x1b[s");
+  process.stdout.write(`\x1b[${row};1H`);
+  process.stdout.clearLine(0);
+  process.stdout.write(line);
+  process.stdout.write("\x1b[u");
+}
+
+function savedExeTypeLine(plan, includeHint = true) {
+  const hint = includeHint
+    ? `${charcoalGradient("  ")}${colorRgb("[S]", BANNER_GRADIENT_END)}${charcoalGradient(" edit")}`
+    : "";
+  return `${contentPad()}${charcoalGradient("spoofer: ")}${colorRgb(formatExeType(plan.defaultType), BANNER_GRADIENT_END)}${hint}`;
+}
+
+function editingSpooferLine(plan) {
+  return [
+    contentPad(),
+    charcoalGradient("spoofer: "),
+    colorRgb(formatExeType(plan.defaultType), BANNER_GRADIENT_END),
+    charcoalGradient("  editing  "),
+    colorRgb("[B]", BANNER_GRADIENT_END),
+    charcoalGradient(" BE  "),
+    colorRgb("[N]", BANNER_GRADIENT_END),
+    charcoalGradient(" none  "),
+    colorRgb("[S]", BANNER_GRADIENT_END),
+    charcoalGradient(" done"),
+  ].join("");
+}
+
+function liveExeTypeLine(plan) {
+  return `${contentPad()}${charcoalGradient("live spoofer: ")}${colorRgb(formatExeType(plan.exeType), BANNER_GRADIENT_END)}`;
+}
+
+function editErrorLine() {
+  return `${contentPad()}${color("Choose B for BE or N for none.", ANSI.red)}`;
+}
+
 function readSavedExeType() {
   if (!fs.existsSync(EXE_TYPE_FILE)) {
     return "";
@@ -2095,10 +2165,8 @@ function askExeTypeKey(query, options = {}) {
 
 async function promptForExeTypeDefault(currentType = "") {
   while (true) {
-    const suffix = currentType ? ` (current ${formatExeType(currentType)})` : "";
-    const answer = await askExeTypeKey(
-      contentPad() + charcoalGradient(`type of exe [B/N]${suffix}: `)
-    );
+    console.log(contentPad() + bannerGradient(currentType ? "editing spoofer" : "choose spoofer"));
+    const answer = await askExeTypeKey(spooferChoicePrompt(currentType));
     const exeType = normalizeExeType(answer);
     if (exeType) {
       saveExeType(exeType);
@@ -2107,15 +2175,6 @@ async function promptForExeTypeDefault(currentType = "") {
 
     console.log(contentPad() + color("Choose B for BE or N for none.", ANSI.red));
   }
-}
-
-async function readExeTypeHotkey() {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    return "";
-  }
-
-  const answer = await askExeTypeKey("", { timeoutMs: EXE_TYPE_EDIT_WINDOW_MS });
-  return answer.trim().toLowerCase();
 }
 
 async function promptForExeTypePlan() {
@@ -2131,23 +2190,155 @@ async function promptForExeTypePlan() {
   return resolveExeTypePlan(savedExeType, bootId);
 }
 
-async function maybeEditExeTypeDefault(plan) {
-  const command = await readExeTypeHotkey();
-  if (!command) {
-    return plan;
+function createExeTypeEditor(initialPlan) {
+  let plan = initialPlan;
+  let lockedLiveType = "";
+  let mode = "idle";
+  let started = false;
+  let wasRaw = false;
+  let errorTimer = null;
+  const stdin = process.stdin;
+
+  function visiblePlan() {
+    return lockedLiveType ? { ...plan, exeType: lockedLiveType } : plan;
   }
 
-  let nextDefault = normalizeExeType(command);
-  if (command === "e" || command === "edit") {
-    nextDefault = await promptForExeTypeDefault(plan.defaultType);
+  function renderStatus(includeHint = true) {
+    const current = visiblePlan();
+    writeAbsoluteLine(
+      SPOOFER_ROW,
+      mode === "editing" ? editingSpooferLine(current) : savedExeTypeLine(current, includeHint)
+    );
+    writeAbsoluteLine(LIVE_SPOOFER_ROW, liveExeTypeLine(current));
   }
 
-  if (!nextDefault) {
-    return plan;
+  function renderIdle() {
+    mode = "idle";
+    renderStatus();
   }
 
-  saveExeType(nextDefault);
-  return resolveExeTypePlan(nextDefault, plan.bootId);
+  function renderEditing() {
+    mode = "editing";
+    renderStatus();
+  }
+
+  function showChoiceError() {
+    writeAbsoluteLine(SPOOFER_ROW, editErrorLine());
+    if (errorTimer) {
+      clearTimeout(errorTimer);
+    }
+    errorTimer = setTimeout(() => {
+      if (mode === "editing") {
+        renderEditing();
+      }
+    }, 900);
+  }
+
+  function setDefault(nextDefault) {
+    const normalized = normalizeExeType(nextDefault);
+    if (!normalized) {
+      return false;
+    }
+
+    saveExeType(normalized);
+    plan = resolveExeTypePlan(normalized, plan.bootId);
+    renderIdle();
+    return true;
+  }
+
+  function handleKey(key) {
+    const command = String(key || "").toLowerCase();
+
+    if (mode === "editing") {
+      if (command === "b" || command === "n") {
+        setDefault(command);
+      } else if (command === "s" || command === "e" || command === "\r" || command === "\n") {
+        renderIdle();
+      } else {
+        showChoiceError();
+      }
+      return;
+    }
+
+    if (command === "s" || command === "e") {
+      renderEditing();
+    }
+  }
+
+  function onData(buffer) {
+    const text = buffer.toString("utf8");
+    if (text.includes("\u0003")) {
+      void cancelRun("SIGINT");
+      return;
+    }
+
+    const cleaned = text.replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "");
+    for (const char of cleaned) {
+      if (char.trim() || char === "\r" || char === "\n") {
+        handleKey(char);
+      }
+    }
+  }
+
+  return {
+    printInitial() {
+      // Paint the two spoofer rows at their fixed layout positions and leave the
+      // cursor on the status board row so the board prints directly below them.
+      // Editing later rewrites these exact rows in place -- no duplicates.
+      if (canMoveCursor()) {
+        process.stdout.write(`\x1b[${SPOOFER_ROW};1H`);
+        process.stdout.clearLine(0);
+        process.stdout.write(savedExeTypeLine(plan));
+        process.stdout.write(`\x1b[${LIVE_SPOOFER_ROW};1H`);
+        process.stdout.clearLine(0);
+        process.stdout.write(liveExeTypeLine(plan));
+        process.stdout.write(`\x1b[${STATUS_BOARD_TOP_ROW};1H`);
+      } else {
+        console.log(savedExeTypeLine(plan));
+        console.log(liveExeTypeLine(plan));
+        console.log();
+      }
+    },
+    start() {
+      if (
+        started ||
+        !process.stdin.isTTY ||
+        !process.stdout.isTTY ||
+        typeof stdin.setRawMode !== "function"
+      ) {
+        return;
+      }
+
+      started = true;
+      wasRaw = stdin.isRaw;
+      stdin.setRawMode(true);
+      stdin.resume();
+      stdin.on("data", onData);
+    },
+    stop() {
+      if (!started) {
+        return;
+      }
+
+      started = false;
+      if (errorTimer) {
+        clearTimeout(errorTimer);
+        errorTimer = null;
+      }
+      stdin.off("data", onData);
+      stdin.setRawMode(Boolean(wasRaw));
+      stdin.pause();
+    },
+    lockLiveSelection() {
+      const current = visiblePlan();
+      lockedLiveType = current.exeType;
+      renderStatus();
+      return current;
+    },
+    getPlan() {
+      return visiblePlan();
+    },
+  };
 }
 
 function askLine(query) {
@@ -2668,13 +2859,8 @@ async function main() {
   }
 
   let exeTypePlan = await promptForExeTypePlan();
-  const shownExeType = exeTypePlan.defaultType;
-  console.log(contentPad() + charcoalGradient(`type of exe: ${formatExeType(exeTypePlan.defaultType)}`));
-  exeTypePlan = await maybeEditExeTypeDefault(exeTypePlan);
-  if (exeTypePlan.defaultType !== shownExeType) {
-    console.log(contentPad() + charcoalGradient(`type of exe: ${formatExeType(exeTypePlan.defaultType)}`));
-  }
-  const exeType = exeTypePlan.exeType;
+  const exeTypeEditor = createExeTypeEditor(exeTypePlan);
+  exeTypeEditor.printInitial();
 
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   cleanDownloadsDir();
@@ -2682,6 +2868,7 @@ async function main() {
   // Show the whole checklist up front (every dot red); each dot turns blue as
   // its step actually finishes.
   const board = createStatusBoard();
+  exeTypeEditor.start();
 
   let browser;
   let page;
@@ -2710,6 +2897,8 @@ async function main() {
     readKeyTimeLeft(page)
       .then(updateHeaderKeyTime)
       .catch(() => updateHeaderKeyTime("not shown by site"));
+    exeTypePlan = exeTypeEditor.lockLiveSelection();
+    const exeType = exeTypePlan.exeType;
     await chooseExeTypeOnWebsite(page, exeType, key);
 
     // 3) Click "Generate Loader" and capture the download it triggers.
@@ -2729,7 +2918,8 @@ async function main() {
     }
 
     if (SHOW_BROWSER) {
-      console.log("\nKeeping the browser open for 5 minutes so you can confirm everything finished...");
+      console.log();
+      console.log(contentPad() + charcoalGradient("browser visible: 5 minutes for testing"));
       await page.waitForTimeout(SHOW_BROWSER_HOLD_MS);
       closeBrowserPromise = trackBrowserClose(browser);
     }
@@ -2749,9 +2939,11 @@ async function main() {
     if (activeBrowser === browser) {
       activeBrowser = null;
     }
+    exeTypeEditor.stop();
   } catch (err) {
     if (SHOW_BROWSER && page && !page.isClosed()) {
-      console.log("\nKeeping the browser open for 5 minutes so you can inspect where it stopped...");
+      console.log();
+      console.log(contentPad() + charcoalGradient("browser visible: 5 minutes to inspect where it stopped"));
       await page.waitForTimeout(SHOW_BROWSER_HOLD_MS).catch(() => {});
     }
 
@@ -2760,6 +2952,7 @@ async function main() {
     } else {
       await trackBrowserClose(browser);
     }
+    exeTypeEditor.stop();
     throw err;
   }
 }

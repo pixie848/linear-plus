@@ -2,7 +2,7 @@
 setlocal
 title linear.pub
 cd /d "%~dp0"
-mode con: cols=82 lines=28 >nul 2>nul
+mode con: cols=82 lines=34 >nul 2>nul
 set "SETUP_MARKER=%~dp0.linear-setup-ready"
 cls
 
