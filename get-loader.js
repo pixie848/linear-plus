@@ -18,6 +18,9 @@ const SITE_URL = "https://launcher.linear.pub/";
 const KEYS_FILE = path.join(__dirname, "keys.txt");
 const EXE_TYPE_FILE = path.join(__dirname, "exe-type.txt");
 const EXE_TYPE_BOOT_STATE_FILE = path.join(__dirname, "exe-type-boot-state.json");
+// While this file exists (and holds a live PID) the loader is considered
+// running, so "Switch Spoofer Type" refuses to open at the same time.
+const LOADER_LOCK_FILE = path.join(__dirname, ".loader-running.lock");
 const BROWSER_PROFILE_DIR = path.join(__dirname, ".browser-profile");
 const DOWNLOAD_DIR = path.join(__dirname, "downloads");
 const DIAGNOSTICS_DIR = path.join(DOWNLOAD_DIR, "diagnostics");
@@ -32,11 +35,15 @@ const KEY_SUBMIT_RETRY_MS = 150;
 const HYDRATED_SUBMIT_FALLBACK_MS = 600;
 const DOWNLOAD_TIMEOUT_MS = 120000;
 const DOWNLOAD_RECOVERY_TIMEOUT_MS = 10000;
+// Navigation resilience: short per-attempt timeout, retried until the overall
+// window elapses, so the loader waits out a missing connection and recovers the
+// instant it returns instead of dying.
+const NAV_ATTEMPT_TIMEOUT_MS = 20000;
+const NAV_RETRY_DELAY_MS = 1200;
+const NAV_TOTAL_TIMEOUT_MS = 120000;
 const KEY_TIME_READ_TIMEOUT_MS = 250;
+const KEY_TIME_SYNC_MS = 500;
 const STATUS_TICK_MS = 120;
-const PROMPT_SHIMMER_TICK_MS = 90;
-const SUCCESS_EXIT_SECONDS = 0;
-const SHOW_BROWSER_HOLD_MS = 300000;
 const BLOCKED_RESOURCE_TYPES = new Set(["image", "font", "media"]);
 const KEY_LENGTH = 50;
 const KEY_PATTERN = /^[A-Za-z0-9]{50}$/;
@@ -345,9 +352,9 @@ function makeSmallArt(text) {
 }
 
 const HEADER_PIXEL_HEIGHT = 5;
-const HEADER_PIXEL_ON = "██";
-const HEADER_PIXEL_OFF = "  ";
-const HEADER_PIXEL_GAP = " ";
+const HEADER_PIXEL_ON = "█";
+const HEADER_PIXEL_OFF = " ";
+const HEADER_PIXEL_GAP = "  ";
 const HEADER_PIXEL_LETTERS = {
   "0": ["111", "101", "101", "101", "111"],
   "1": ["010", "110", "010", "010", "111"],
@@ -364,10 +371,14 @@ const HEADER_PIXEL_LETTERS = {
   E: ["111", "100", "111", "100", "111"],
   H: ["101", "101", "111", "101", "101"],
   K: ["101", "101", "110", "101", "101"],
-  M: ["101", "111", "111", "101", "101"],
+  // 5 pixels wide with the classic centre "peak" so it reads clearly as M and
+  // can't be mistaken for H (glyphs may be wider than the default 3 pixels).
+  M: ["10001", "11011", "10101", "10001", "10001"],
   O: ["111", "101", "101", "101", "111"],
   P: ["111", "101", "111", "100", "100"],
+  S: ["0111", "1000", "0110", "0001", "1110"],
   Y: ["101", "101", "010", "010", "010"],
+  ":": ["0", "1", "0", "1", "0"],
   " ": ["0", "0", "0", "0", "0"],
 };
 
@@ -421,15 +432,15 @@ const LINEAR_HEIGHT = LINEAR_ART.split(/\r?\n/).length;
 const HEADER_BLOCK_GAP = 2;
 const TIME_HEIGHT = HEADER_PIXEL_HEIGHT;
 const TIME_ROW = TOP_GAP + LINEAR_HEIGHT + HEADER_BLOCK_GAP + 1;
-const CONTENT_ROW = TIME_ROW + TIME_HEIGHT + HEADER_BLOCK_GAP;
-// The key line sits on CONTENT_ROW; the two spoofer rows sit right under it,
-// then a blank row, then the status board. Keeping these as fixed absolute rows
-// lets the spoofer editor rewrite its lines in place without ever duplicating
-// them, no matter where later output has left the cursor.
-const SPOOFER_ROW = CONTENT_ROW + 1;
-const LIVE_SPOOFER_ROW = CONTENT_ROW + 2;
+const CONTENT_ROW = TIME_ROW + TIME_HEIGHT + 1;
+// Evenly spaced from the key line down: key on CONTENT_ROW, a blank, the spoofer
+// row, a blank, then the status board. Keeping these as fixed absolute rows lets
+// each block draw at a known spot regardless of where earlier output (like the
+// initial spoofer prompt) left the cursor.
+const SPOOFER_ROW = CONTENT_ROW + 2;
 const STATUS_BOARD_TOP_ROW = CONTENT_ROW + 4;
 const DEFAULT_TERM_COLUMNS = 82;
+const PROMPT_WINDOW_ROWS = TIME_ROW + TIME_HEIGHT + 1;
 
 function color(text, ansiColor) {
   return `${ansiColor}${text}${ANSI.reset}`;
@@ -633,35 +644,154 @@ function envFlag(name) {
   return /^(1|true|yes|on)$/i.test(String(process.env[name] || ""));
 }
 
-function printStartupBanner() {
-  // Clear and home so the fixed-row layout below always anchors to the top,
-  // and hide the hardware cursor so it can't blink around while we redraw.
-  if (process.stdout.isTTY) {
-    process.stdout.write("\x1b[2J\x1b[H\x1b[?25l");
-  }
+let currentTimeZoneLines = null;
+let currentKeyValue = "";
+let currentKeyLine = "";
+let currentSpooferPlan = null;
+let currentSpooferLine = "";
+let activeStatusBoard = null;
+let desiredConsoleRows = PROMPT_WINDOW_ROWS;
+let consoleResizeTimer = null;
+let fittingConsoleWindow = false;
+let consoleLockTimer = null;
 
-  process.stdout.write("\n".repeat(TOP_GAP)); // small gap from the top edge
-  console.log(centerArt(LINEAR_ART, linearPubBanner()));
-  // Leave the time zone blank (it fills in once the key time is known) and
-  // land the cursor on the content row.
-  process.stdout.write("\n".repeat(CONTENT_ROW - (TOP_GAP + LINEAR_HEIGHT + 1)));
+function markConsoleFitSettled() {
+  const timer = setTimeout(() => {
+    fittingConsoleWindow = false;
+  }, 200);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
 }
 
-async function printFinishedBanner() {
-  console.log();
-  const pad = contentPad();
+function fitConsoleWindow(rows = desiredConsoleRows) {
+  desiredConsoleRows = Math.max(10, Math.trunc(rows) || PROMPT_WINDOW_ROWS);
 
-  if (SUCCESS_EXIT_SECONDS <= 0) {
-    writeStatusLine(pad + bannerGradient("finished, closing now"), true);
+  if (process.platform !== "win32" || !process.stdout.isTTY) {
     return;
   }
 
-  for (let remaining = SUCCESS_EXIT_SECONDS; remaining > 0; remaining -= 1) {
-    writeStatusLine(pad + bannerGradient(`finished, closing in ${remaining} seconds`));
-    await sleep(1000);
+  fittingConsoleWindow = true;
+  try {
+    execFileSync(
+      process.env.ComSpec || "cmd.exe",
+      ["/d", "/s", "/c", `mode con: cols=${DEFAULT_TERM_COLUMNS} lines=${desiredConsoleRows}`],
+      { timeout: 1500, windowsHide: true, stdio: "ignore" }
+    );
+  } catch {
+    // Resizing is cosmetic; the layout still redraws against the current window.
+  } finally {
+    configureConsole({ quickEdit: false, pinTopmost: false });
+    markConsoleFitSettled();
+  }
+}
+
+function writeAbsoluteLine(row, line) {
+  if (!canMoveCursor()) {
+    return;
   }
 
-  writeStatusLine(pad + bannerGradient("finished, closing now"), true);
+  process.stdout.write("\x1b[s");
+  process.stdout.write(`\x1b[${row};1H`);
+  process.stdout.clearLine(0);
+  process.stdout.write(line);
+  process.stdout.write("\x1b[u");
+}
+
+function drawBaseBanner() {
+  if (!process.stdout.isTTY) {
+    return;
+  }
+
+  process.stdout.write("\x1b[2J\x1b[H\x1b[?25l");
+  process.stdout.write("\n".repeat(TOP_GAP));
+  console.log(centerArt(LINEAR_ART, linearPubBanner()));
+}
+
+function redrawLayout() {
+  if (!canMoveCursor()) {
+    return;
+  }
+
+  drawBaseBanner();
+  drawTimeZone(currentTimeZoneLines, { remember: false });
+
+  if (currentKeyValue) {
+    currentKeyLine = keyStatusLine(currentKeyValue);
+    writeAbsoluteLine(CONTENT_ROW, currentKeyLine);
+  }
+
+  if (currentSpooferPlan) {
+    currentSpooferLine = spooferStatusLine(currentSpooferPlan);
+    for (let row = CONTENT_ROW + 1; row < STATUS_BOARD_TOP_ROW; row += 1) {
+      process.stdout.write(`\x1b[${row};1H`);
+      process.stdout.clearLine(0);
+      if (row === SPOOFER_ROW) {
+        process.stdout.write(currentSpooferLine);
+      }
+    }
+  }
+
+  if (activeStatusBoard) {
+    activeStatusBoard.redraw();
+  }
+}
+
+function scheduleLayoutRedraw() {
+  if (fittingConsoleWindow || !canMoveCursor()) {
+    return;
+  }
+
+  if (consoleResizeTimer) {
+    clearTimeout(consoleResizeTimer);
+  }
+
+  consoleResizeTimer = setTimeout(() => {
+    consoleResizeTimer = null;
+    fitConsoleWindow(desiredConsoleRows);
+    redrawLayout();
+  }, 120);
+}
+
+function installResizeHandler() {
+  if (process.stdout && typeof process.stdout.on === "function") {
+    process.stdout.on("resize", scheduleLayoutRedraw);
+  }
+}
+
+function startConsoleLockWatchdog() {
+  if (consoleLockTimer || process.platform !== "win32" || !process.stdout.isTTY) {
+    return;
+  }
+
+  consoleLockTimer = setInterval(() => {
+    configureConsoleAsync({ quickEdit: false, pinTopmost: false });
+  }, 4000);
+
+  if (typeof consoleLockTimer.unref === "function") {
+    consoleLockTimer.unref();
+  }
+}
+
+function printStartupBanner() {
+  currentTimeZoneLines = null;
+  currentKeyValue = "";
+  currentKeyLine = "";
+  currentSpooferPlan = null;
+  currentSpooferLine = "";
+  activeStatusBoard = null;
+  fitConsoleWindow(PROMPT_WINDOW_ROWS);
+
+  // Clear and home so the fixed-row layout below always anchors to the top,
+  // and hide the hardware cursor so it can't blink around while we redraw.
+  drawBaseBanner();
+  // Leave the time zone blank (it fills in once the key time is known) and
+  // land the cursor on the small prompt window's last row.
+  if (canMoveCursor()) {
+    process.stdout.write(`\x1b[${PROMPT_WINDOW_ROWS};1H`);
+  } else {
+    process.stdout.write("\n".repeat(PROMPT_WINDOW_ROWS - (TOP_GAP + LINEAR_HEIGHT + 1)));
+  }
 }
 
 function sleep(ms) {
@@ -689,6 +819,28 @@ function trackBrowserClose(browser) {
       activeBrowser = null;
     }
   });
+}
+
+function browserLooksClosed(browser, page) {
+  if (page && page.isClosed()) {
+    return true;
+  }
+
+  if (browser && typeof browser.isConnected === "function") {
+    return !browser.isConnected();
+  }
+
+  return !browser && !page;
+}
+
+async function waitForVisibleBrowserClose(browser, page) {
+  while (!browserLooksClosed(browser, page)) {
+    await sleep(500);
+  }
+
+  if (activeBrowser === browser) {
+    activeBrowser = null;
+  }
 }
 
 function installCancellationHandlers() {
@@ -809,20 +961,6 @@ async function createAutomationPage(options = {}) {
   return { browser, context, page };
 }
 
-function writeStatusLine(line, newline = false) {
-  if (process.stdout.isTTY && process.stdout.clearLine && process.stdout.cursorTo) {
-    process.stdout.clearLine(0);
-    process.stdout.cursorTo(0);
-    process.stdout.write(line);
-    if (newline) {
-      process.stdout.write("\n");
-    }
-    return;
-  }
-
-  console.log(line);
-}
-
 function canMoveCursor() {
   return (
     process.stdout.isTTY &&
@@ -832,29 +970,63 @@ function canMoveCursor() {
   );
 }
 
-// Pull days / hours / minutes out of the site's time string.
-function extractDHM(text) {
+function formatTwoDigits(value) {
+  return String(Math.max(0, Number.parseInt(value, 10) || 0)).padStart(2, "0");
+}
+
+function parseClockTime(text) {
+  const match = String(text || "").match(/\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b/);
+  if (!match) {
+    return null;
+  }
+
+  if (match[3] !== undefined) {
+    return { d: "0", h: match[1], m: match[2], s: match[3] };
+  }
+
+  return { d: "0", h: "0", m: match[1], s: match[2] };
+}
+
+function extractUnitTime(text) {
+  const source = String(text || "");
+  const unit = (pattern) => {
+    const match = source.match(pattern);
+    return match ? match[1] : "0";
+  };
+  const values = {
+    d: unit(/(\d+)\s*(?:d|day|days)\b/i),
+    h: unit(/(\d+)\s*(?:h|hr|hrs|hour|hours)\b/i),
+    m: unit(/(\d+)\s*(?:m|min|mins|minute|minutes)\b/i),
+    s: unit(/(\d+)\s*(?:s|sec|secs|second|seconds)\b/i),
+  };
+
+  return Object.values(values).some((value) => value !== "0") ? values : null;
+}
+
+// Pull days / hours / minutes / seconds out of the site's time string.
+function extractDHMS(text) {
   if (!text || typeof text !== "string") {
     return null;
   }
 
-  const days = text.match(/(\d+)\s*d(?:ay)?s?\b/i);
-  const hours = text.match(/(\d+)\s*h(?:ou)?r?s?\b/i);
-  const minutes = text.match(/(\d+)\s*m(?:in)?(?:ute)?s?\b/i);
+  return extractUnitTime(text) || parseClockTime(text);
+}
 
-  if (!days && !hours && !minutes) {
-    return null;
+function keyTimeHeaderText(timeLeft) {
+  const time = extractDHMS(timeLeft);
+  if (!time) {
+    return "";
   }
 
-  return {
-    d: days ? days[1] : "0",
-    h: hours ? hours[1] : "0",
-    m: minutes ? minutes[1] : "0",
-  };
+  return `${time.d}D ${formatTwoDigits(time.h)}H ${formatTwoDigits(time.m)}M ${formatTwoDigits(time.s)}S`;
 }
 
 // Fill the reserved time zone with a block of small art (or clear it).
-function drawTimeZone(lines) {
+function drawTimeZone(lines, options = {}) {
+  if (options.remember !== false) {
+    currentTimeZoneLines = lines || null;
+  }
+
   if (!canMoveCursor()) {
     if (lines) {
       console.log(lines.join("\n"));
@@ -873,15 +1045,15 @@ function drawTimeZone(lines) {
   process.stdout.write("\x1b[u");
 }
 
-// Show the key time as banner art ("17D 20H 30M"). Until the site reports a
+// Show the key time as banner art ("17D 20H 30M 45S"). Until the site reports a
 // parsable time, the zone simply stays empty - no placeholder dashes.
 function updateHeaderKeyTime(timeLeft) {
-  const dhm = extractDHM(timeLeft);
-  if (!dhm) {
+  const text = keyTimeHeaderText(timeLeft);
+  if (!text) {
     return;
   }
 
-  drawTimeZone(centeredHeaderArtLines(`${dhm.d}D ${dhm.h}H ${dhm.m}M`));
+  drawTimeZone(centeredHeaderArtLines(text));
 }
 
 const STATUS_STEPS = [
@@ -893,14 +1065,14 @@ const STATUS_STEPS = [
 const STATUS_SPEED_WIDTH = 9;
 const STATUS_LABEL_WIDTH = Math.max(...STATUS_STEPS.map((step) => step.label.length));
 const STATUS_ROW_GAP = 1;
+const STATUS_BOARD_STEP_COUNT = STATUS_STEPS.length + 1;
+const STATUS_BOARD_HEIGHT =
+  STATUS_BOARD_STEP_COUNT + STATUS_ROW_GAP * Math.max(0, STATUS_BOARD_STEP_COUNT - 1);
+const RUN_WINDOW_ROWS = STATUS_BOARD_TOP_ROW + STATUS_BOARD_HEIGHT;
 // The column every dot lines up on: "status: " + widest label + " " + "100%" +
 // " " + speed field + one space before the dot.
 const STATUS_DOT_COLUMN =
   "status: ".length + STATUS_LABEL_WIDTH + 1 + 4 + 1 + STATUS_SPEED_WIDTH + 1;
-
-function statusBoardHeight() {
-  return STATUS_STEPS.length + STATUS_ROW_GAP * Math.max(0, STATUS_STEPS.length - 1);
-}
 
 // Pad by visible width, ignoring ANSI colour codes, so coloured cells still align.
 function padVisibleEnd(text, width) {
@@ -935,15 +1107,18 @@ function formatDownloadDetail(percent, bytesPerSecond) {
 }
 
 // A fixed checklist printed up front with every dot red. A dot only turns blue
-// once its step has genuinely completed.
-function createStatusBoard() {
-  const steps = STATUS_STEPS.map((step) => ({ ...step, done: false, detail: "" }));
+// once its step has genuinely completed. The first row is the BE spoofer on/off
+// status: blue when a BE loader has already run this Windows boot, red when it
+// has not (e.g. right after a reboot). It flips to blue live if this run uses BE.
+function createStatusBoard(options = {}) {
+  const steps = [
+    { key: "beStatus", label: "BE spoofer", done: Boolean(options.beUsed), detail: "" },
+    ...STATUS_STEPS.map((step) => ({ ...step, done: false, detail: "" })),
+  ];
   const useCursor = canMoveCursor();
-  const margin = contentMargin();
-  const dotColumn = contentWidth() - 1;
-  const boardHeight = statusBoardHeight();
-
   function lineFor(step) {
+    const margin = contentMargin();
+    const dotColumn = contentWidth() - 1;
     // Charcoal-metallic label; the live detail and dot keep their own colours.
     let preDot = `${" ".repeat(margin)}${charcoalGradient(`status: ${step.label}`)}`;
     if (step.detail) {
@@ -953,7 +1128,12 @@ function createStatusBoard() {
   }
 
   function redraw() {
-    process.stdout.write(`\x1b[${boardHeight}A`);
+    if (!useCursor) {
+      return;
+    }
+
+    process.stdout.write("\x1b[s");
+    process.stdout.write(`\x1b[${STATUS_BOARD_TOP_ROW};1H`);
     steps.forEach((step, index) => {
       process.stdout.cursorTo(0);
       process.stdout.clearLine(0);
@@ -964,6 +1144,7 @@ function createStatusBoard() {
         process.stdout.write("\n");
       }
     });
+    process.stdout.write("\x1b[u");
   }
 
   function update(key, changes) {
@@ -981,14 +1162,8 @@ function createStatusBoard() {
     }
   }
 
-  steps.forEach((step, index) => {
-    console.log(lineFor(step));
-    for (let gap = 0; gap < STATUS_ROW_GAP && index < steps.length - 1; gap += 1) {
-      console.log();
-    }
-  });
-
-  return {
+  const api = {
+    redraw,
     setDetail(key, detail) {
       update(key, { detail });
     },
@@ -996,6 +1171,21 @@ function createStatusBoard() {
       update(key, { done: true });
     },
   };
+
+  activeStatusBoard = api;
+
+  if (useCursor) {
+    redraw();
+  } else {
+    steps.forEach((step, index) => {
+      console.log(lineFor(step));
+      for (let gap = 0; gap < STATUS_ROW_GAP && index < steps.length - 1; gap += 1) {
+        console.log();
+      }
+    });
+  }
+
+  return api;
 }
 
 function formatDownloadPercent(percent) {
@@ -1404,6 +1594,45 @@ async function readKeyTimeLeft(page) {
     .innerText({ timeout: KEY_TIME_READ_TIMEOUT_MS })
     .catch(() => "");
   return parseKeyTimeLeft(bodyText) || "not shown by site";
+}
+
+function startKeyTimeHeaderSync(page) {
+  if (!canMoveCursor()) {
+    readKeyTimeLeft(page)
+      .then(updateHeaderKeyTime)
+      .catch(() => {});
+    return () => {};
+  }
+
+  let stopped = false;
+  let timer = null;
+
+  async function tick() {
+    timer = null;
+    if (stopped || !page || page.isClosed()) {
+      return;
+    }
+
+    try {
+      updateHeaderKeyTime(await readKeyTimeLeft(page));
+    } catch {
+      // A transient DOM/navigation miss should not kill the live timer.
+    }
+
+    if (!stopped && page && !page.isClosed()) {
+      timer = setTimeout(tick, KEY_TIME_SYNC_MS);
+    }
+  }
+
+  timer = setTimeout(tick, 0);
+
+  return () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
 }
 
 function maskKey(key) {
@@ -1954,11 +2183,11 @@ function normalizeExeType(value) {
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
-  if (["b", "be", "before execution", "beforeexecution", "yes", "y"].includes(cleaned)) {
+  if (["1", "be", "before execution", "beforeexecution"].includes(cleaned)) {
     return "be";
   }
 
-  if (["no", "n", "none", "normal", "default"].includes(cleaned)) {
+  if (["2", "no", "none", "normal", "default"].includes(cleaned)) {
     return "no";
   }
 
@@ -1974,59 +2203,66 @@ function spooferChoicePrompt(currentType = "") {
   return [
     contentPad(),
     charcoalGradient("spoofer  "),
-    colorRgb("[B]", BANNER_GRADIENT_END),
+    colorRgb("[1]", BANNER_GRADIENT_END),
     charcoalGradient(" BE   "),
-    colorRgb("[N]", BANNER_GRADIENT_END),
+    colorRgb("[2]", BANNER_GRADIENT_END),
     charcoalGradient(" none"),
     current,
     charcoalGradient(": "),
   ].join("");
 }
 
-// Rewrite a single fixed layout row in place without disturbing the cursor --
-// the same save / jump / restore trick the time zone uses. Because it targets an
-// absolute row, it never duplicates a line even if other output has since moved
-// the cursor below it.
-function writeAbsoluteLine(row, line) {
-  if (!canMoveCursor()) {
-    return;
+// Draw the fixed spoofer status line (which exe type this run will use) at its
+// absolute layout row, clear the blank row beneath it, and land the cursor on
+// the status board row so the checklist prints directly below. The spoofer type
+// is chosen up front -- from the start prompt or the "Switch Spoofer Type" tool
+// -- and never changes mid-run, so this line is informational only.
+function spooferStatusLine(plan) {
+  return `${contentPad()}${charcoalGradient("spoofer: ")}${colorRgb(
+    formatExeType(plan.exeType),
+    BANNER_GRADIENT_END
+  )}`;
+}
+
+function printSpooferStatus(plan) {
+  // The BE "already ran this boot" state is shown as a dot on the status board
+  // now, so this line just reports the type this run will use.
+  currentSpooferPlan = plan;
+  const line = spooferStatusLine(plan);
+  currentSpooferLine = line;
+
+  if (canMoveCursor()) {
+    // Clear every row between the key line and the status board (wiping any
+    // leftover "choose spoofer" prompt), drawing the spoofer line in its slot.
+    for (let row = CONTENT_ROW + 1; row < STATUS_BOARD_TOP_ROW; row += 1) {
+      process.stdout.write(`\x1b[${row};1H`);
+      process.stdout.clearLine(0);
+      if (row === SPOOFER_ROW) {
+        process.stdout.write(line);
+      }
+    }
+    process.stdout.write(`\x1b[${STATUS_BOARD_TOP_ROW};1H`);
+  } else {
+    console.log(line);
+    console.log();
   }
-
-  process.stdout.write("\x1b[s");
-  process.stdout.write(`\x1b[${row};1H`);
-  process.stdout.clearLine(0);
-  process.stdout.write(line);
-  process.stdout.write("\x1b[u");
 }
 
-function savedExeTypeLine(plan, includeHint = true) {
-  const hint = includeHint
-    ? `${charcoalGradient("  ")}${colorRgb("[S]", BANNER_GRADIENT_END)}${charcoalGradient(" edit")}`
-    : "";
-  return `${contentPad()}${charcoalGradient("spoofer: ")}${colorRgb(formatExeType(plan.defaultType), BANNER_GRADIENT_END)}${hint}`;
+function keyStatusLine(key) {
+  return `${contentPad()}${charcoalGradient(`key: ${maskKey(key)} (${key.length} chars)`)}`;
 }
 
-function editingSpooferLine(plan) {
-  return [
-    contentPad(),
-    charcoalGradient("spoofer: "),
-    colorRgb(formatExeType(plan.defaultType), BANNER_GRADIENT_END),
-    charcoalGradient("  editing  "),
-    colorRgb("[B]", BANNER_GRADIENT_END),
-    charcoalGradient(" BE  "),
-    colorRgb("[N]", BANNER_GRADIENT_END),
-    charcoalGradient(" none  "),
-    colorRgb("[S]", BANNER_GRADIENT_END),
-    charcoalGradient(" done"),
-  ].join("");
-}
+function printKeyStatus(key) {
+  currentKeyValue = key;
+  currentKeyLine = keyStatusLine(key);
+  fitConsoleWindow(RUN_WINDOW_ROWS);
 
-function liveExeTypeLine(plan) {
-  return `${contentPad()}${charcoalGradient("live spoofer: ")}${colorRgb(formatExeType(plan.exeType), BANNER_GRADIENT_END)}`;
-}
-
-function editErrorLine() {
-  return `${contentPad()}${color("Choose B for BE or N for none.", ANSI.red)}`;
+  if (canMoveCursor()) {
+    redrawLayout();
+    writeAbsoluteLine(CONTENT_ROW, currentKeyLine);
+  } else {
+    console.log(currentKeyLine);
+  }
 }
 
 function readSavedExeType() {
@@ -2173,7 +2409,7 @@ async function promptForExeTypeDefault(currentType = "") {
       return exeType;
     }
 
-    console.log(contentPad() + color("Choose B for BE or N for none.", ANSI.red));
+    console.log(contentPad() + color("Choose 1 for BE or 2 for none.", ANSI.red));
   }
 }
 
@@ -2188,157 +2424,6 @@ async function promptForExeTypePlan() {
   }
 
   return resolveExeTypePlan(savedExeType, bootId);
-}
-
-function createExeTypeEditor(initialPlan) {
-  let plan = initialPlan;
-  let lockedLiveType = "";
-  let mode = "idle";
-  let started = false;
-  let wasRaw = false;
-  let errorTimer = null;
-  const stdin = process.stdin;
-
-  function visiblePlan() {
-    return lockedLiveType ? { ...plan, exeType: lockedLiveType } : plan;
-  }
-
-  function renderStatus(includeHint = true) {
-    const current = visiblePlan();
-    writeAbsoluteLine(
-      SPOOFER_ROW,
-      mode === "editing" ? editingSpooferLine(current) : savedExeTypeLine(current, includeHint)
-    );
-    writeAbsoluteLine(LIVE_SPOOFER_ROW, liveExeTypeLine(current));
-  }
-
-  function renderIdle() {
-    mode = "idle";
-    renderStatus();
-  }
-
-  function renderEditing() {
-    mode = "editing";
-    renderStatus();
-  }
-
-  function showChoiceError() {
-    writeAbsoluteLine(SPOOFER_ROW, editErrorLine());
-    if (errorTimer) {
-      clearTimeout(errorTimer);
-    }
-    errorTimer = setTimeout(() => {
-      if (mode === "editing") {
-        renderEditing();
-      }
-    }, 900);
-  }
-
-  function setDefault(nextDefault) {
-    const normalized = normalizeExeType(nextDefault);
-    if (!normalized) {
-      return false;
-    }
-
-    saveExeType(normalized);
-    plan = resolveExeTypePlan(normalized, plan.bootId);
-    renderIdle();
-    return true;
-  }
-
-  function handleKey(key) {
-    const command = String(key || "").toLowerCase();
-
-    if (mode === "editing") {
-      if (command === "b" || command === "n") {
-        setDefault(command);
-      } else if (command === "s" || command === "e" || command === "\r" || command === "\n") {
-        renderIdle();
-      } else {
-        showChoiceError();
-      }
-      return;
-    }
-
-    if (command === "s" || command === "e") {
-      renderEditing();
-    }
-  }
-
-  function onData(buffer) {
-    const text = buffer.toString("utf8");
-    if (text.includes("\u0003")) {
-      void cancelRun("SIGINT");
-      return;
-    }
-
-    const cleaned = text.replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "");
-    for (const char of cleaned) {
-      if (char.trim() || char === "\r" || char === "\n") {
-        handleKey(char);
-      }
-    }
-  }
-
-  return {
-    printInitial() {
-      // Paint the two spoofer rows at their fixed layout positions and leave the
-      // cursor on the status board row so the board prints directly below them.
-      // Editing later rewrites these exact rows in place -- no duplicates.
-      if (canMoveCursor()) {
-        process.stdout.write(`\x1b[${SPOOFER_ROW};1H`);
-        process.stdout.clearLine(0);
-        process.stdout.write(savedExeTypeLine(plan));
-        process.stdout.write(`\x1b[${LIVE_SPOOFER_ROW};1H`);
-        process.stdout.clearLine(0);
-        process.stdout.write(liveExeTypeLine(plan));
-        process.stdout.write(`\x1b[${STATUS_BOARD_TOP_ROW};1H`);
-      } else {
-        console.log(savedExeTypeLine(plan));
-        console.log(liveExeTypeLine(plan));
-        console.log();
-      }
-    },
-    start() {
-      if (
-        started ||
-        !process.stdin.isTTY ||
-        !process.stdout.isTTY ||
-        typeof stdin.setRawMode !== "function"
-      ) {
-        return;
-      }
-
-      started = true;
-      wasRaw = stdin.isRaw;
-      stdin.setRawMode(true);
-      stdin.resume();
-      stdin.on("data", onData);
-    },
-    stop() {
-      if (!started) {
-        return;
-      }
-
-      started = false;
-      if (errorTimer) {
-        clearTimeout(errorTimer);
-        errorTimer = null;
-      }
-      stdin.off("data", onData);
-      stdin.setRawMode(Boolean(wasRaw));
-      stdin.pause();
-    },
-    lockLiveSelection() {
-      const current = visiblePlan();
-      lockedLiveType = current.exeType;
-      renderStatus();
-      return current;
-    },
-    getPlan() {
-      return visiblePlan();
-    },
-  };
 }
 
 function askLine(query) {
@@ -2357,7 +2442,7 @@ function askLine(query) {
 
 function askKeyPaste() {
   if (typeof process.stdin.setRawMode !== "function") {
-    return askLine(`${shimmerStar(0)} `);
+    return askLine("key: ");
   }
 
   return new Promise((resolve, reject) => {
@@ -2369,16 +2454,26 @@ function askKeyPaste() {
     let pasteTimer = null;
     let clipboardTimer = null;
     let pendingPasteText = "";
-    let shimmerFrame = 0;
     let rejectingText = false;
-    let promptRejected = false;
-    let lastClipboardFingerprint = "";
 
-    // Redraw the whole prompt line: the prompt "*" stays red after a rejection,
-    // while entered characters keep the blue key gradient.
+    function clearPromptLine() {
+      if (process.stdout.cursorTo && process.stdout.clearLine) {
+        process.stdout.cursorTo(0);
+        process.stdout.clearLine(0);
+      } else {
+        process.stdout.write("\r\x1b[2K");
+      }
+    }
+
+    // Redraw the whole prompt line. The idle clipboard-watch state is blank; no
+    // floating prompt star under COPY KEY.
     function renderPrompt() {
-      const promptStar = promptRejected ? rejectShimmerStar : shimmerStar;
-      let line = `${pad}${promptStar(shimmerFrame)} `;
+      if (!value) {
+        clearPromptLine();
+        return;
+      }
+
+      let line = `${pad}  `;
       for (let i = 0; i < value.length; i += 1) {
         line += maskStar(i);
       }
@@ -2392,21 +2487,12 @@ function askKeyPaste() {
       }
     }
 
-    const shimmerTimer = setInterval(() => {
-      if (finished || rejectingText) {
-        return;
-      }
-      shimmerFrame += 1;
-      renderPrompt();
-    }, PROMPT_SHIMMER_TICK_MS);
-
     function finish(answer, error) {
       if (finished) {
         return;
       }
 
       finished = true;
-      clearInterval(shimmerTimer);
       if (pasteTimer) {
         clearTimeout(pasteTimer);
       }
@@ -2415,17 +2501,19 @@ function askKeyPaste() {
         clipboardTimer = null;
       }
       if (!error) {
-        renderPrompt();
+        clearPromptLine();
       }
       stdin.off("data", onData);
       stdin.setRawMode(Boolean(wasRaw));
       stdin.pause();
-      process.stdout.write("\n");
+      if (!canMoveCursor()) {
+        process.stdout.write("\n");
+      }
 
       if (error) {
         reject(error);
       } else {
-        resolve({ value: answer, promptRejected });
+        resolve({ value: answer });
       }
     }
 
@@ -2435,7 +2523,6 @@ function askKeyPaste() {
         return false;
       }
 
-      promptRejected = false;
       value = key;
       finish(value);
       return true;
@@ -2461,7 +2548,6 @@ function askKeyPaste() {
         return;
       }
 
-      promptRejected = true;
       rejectingText = true;
       value = "";
       pendingPasteText = "";
@@ -2516,27 +2602,7 @@ function askKeyPaste() {
         return;
       }
 
-      // Everything below only decides whether to animate a rejection of non-key
-      // text, so skip it while a rejection is already playing.
-      if (rejectingText) {
-        return;
-      }
-
-      const clipboardFingerprint = rejectedFingerprint(clipboardText);
-      if (!clipboardFingerprint) {
-        return;
-      }
-
-      // Only animate when the junk actually changes, so text we already
-      // rejected does not re-trigger the animation on every poll.
-      if (clipboardFingerprint === lastClipboardFingerprint) {
-        return;
-      }
-      lastClipboardFingerprint = clipboardFingerprint;
-
-      if (!value) {
-        void showRejectedText(clipboardText);
-      }
+      // Clipboard junk is ignored silently. Only a real key changes the screen.
     }
 
     // Poll one clipboard read at a time, scheduling the next only after the
@@ -2674,7 +2740,7 @@ async function promptForKey() {
   const cursorReady = canMoveCursor();
 
   // COPY KEY takes the reserved time zone (same size and spot as the key time
-  // that replaces it later); the prompt sits on the content row below.
+  // that replaces it later). The idle prompt line below stays blank.
   if (cursorReady) {
     drawTimeZone(centeredHeaderArtLines("COPY KEY"));
   } else {
@@ -2687,7 +2753,7 @@ async function promptForKey() {
 
   while (!key) {
     if (cursorReady) {
-      process.stdout.write(`\x1b[${CONTENT_ROW};1H`);
+      process.stdout.write(`\x1b[${PROMPT_WINDOW_ROWS};1H`);
       process.stdout.clearLine(0);
     }
 
@@ -2705,7 +2771,7 @@ async function promptForKey() {
 
     const message = color(`Invalid key. Paste a ${KEY_LENGTH}-character letters/numbers key.`, ANSI.red);
     if (cursorReady) {
-      process.stdout.write(`\x1b[${CONTENT_ROW + 1};1H`);
+      process.stdout.write(`\x1b[${PROMPT_WINDOW_ROWS};1H`);
       process.stdout.clearLine(0);
       process.stdout.write(contentPad() + message);
       showedInvalid = true;
@@ -2715,16 +2781,17 @@ async function promptForKey() {
   }
 
   if (cursorReady) {
-    // COPY KEY vanishes instantly, then the stars worm back into the prompt
-    // right where the "key:" line will sit.
+    // Show the accepted key length as the blue retracting snake, then expand
+    // into the full run layout.
+    process.stdout.write(`\x1b[${PROMPT_WINDOW_ROWS};1H`);
+    await animateStarsRetract(key.length);
     drawTimeZone(null);
     if (showedInvalid) {
-      process.stdout.write(`\x1b[${CONTENT_ROW + 1};1H`);
+      process.stdout.write(`\x1b[${PROMPT_WINDOW_ROWS};1H`);
       process.stdout.clearLine(0);
     }
-    process.stdout.write(`\x1b[${CONTENT_ROW};1H`);
-    await animateStarsRetract(key.length);
-    process.stdout.write(`\x1b[${CONTENT_ROW};1H`);
+    process.stdout.write(`\x1b[${PROMPT_WINDOW_ROWS};1H`);
+    process.stdout.clearLine(0);
   }
 
   saveCurrentKey(key);
@@ -2781,8 +2848,17 @@ function runDownloaded(savePath) {
 function buildConsoleScript(quickEdit, pinTopmost) {
   const quickEditValue = quickEdit ? "1" : "0";
   const topmostValue = pinTopmost ? "1" : "0";
-  // 0x80 ENABLE_EXTENDED_FLAGS, 0x40 ENABLE_QUICK_EDIT_MODE, 0x10 ENABLE_MOUSE_INPUT.
-  return `$quickEdit = ${quickEditValue}; $topmost = ${topmostValue}; $s = '[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateFile(string n, uint a, uint sh, IntPtr t, uint c, uint f, IntPtr hh); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int z, uint f);'; $k = Add-Type -MemberDefinition $s -Name ConsoleTweaks -Namespace ConIO -PassThru; $h = $k::CreateFile('CONIN$', [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero); $m = 0; [void]$k::GetConsoleMode($h, [ref]$m); if ($quickEdit) { $m = (($m -bor 0x80) -bor 0x40) } else { $m = ((($m -bor 0x80) -band (-bnot 0x40)) -band (-bnot 0x10)) }; [void]$k::SetConsoleMode($h, $m); if ($topmost) { [void]$k::SetWindowPos($k::GetConsoleWindow(), [IntPtr](-1), 0, 0, 0, 0, [uint32]0x0003) }`;
+  // Input flags: 0x80 EXTENDED, 0x40 QUICK_EDIT, 0x20 INSERT,
+  // 0x10 MOUSE_INPUT, 0x08 WINDOW_INPUT. Apply through both STDIN and CONIN$:
+  // different Windows hosts can expose one more reliably than the other.
+  return `$quickEdit = ${quickEditValue}; $topmost = ${topmostValue}; $s = @'
+[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateFile(string n, uint a, uint sh, IntPtr t, uint c, uint f, IntPtr hh);
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m);
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int z, uint f);
+'@; try { New-Item -Path 'HKCU:\\Console\\linear.pub' -Force | Out-Null; New-ItemProperty -Path 'HKCU:\\Console\\linear.pub' -Name QuickEdit -PropertyType DWord -Value 0 -Force | Out-Null } catch {}; $k = Add-Type -MemberDefinition $s -Name ConsoleTweaks -Namespace ConIO -PassThru; $handles = @($k::GetStdHandle(-10), $k::CreateFile('CONIN$', [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)); foreach ($h in $handles) { if ($h -eq [IntPtr]::Zero -or $h -eq [IntPtr](-1)) { continue }; $m = 0; if ($k::GetConsoleMode($h, [ref]$m)) { $m = $m -bor 0x80; if ($quickEdit) { $m = $m -bor 0x40 } else { $m = $m -band (-bnot 0x40); $m = $m -band (-bnot 0x20); $m = $m -band (-bnot 0x10); $m = $m -band (-bnot 0x08) }; [void]$k::SetConsoleMode($h, $m) } }; if ($topmost) { [void]$k::SetWindowPos($k::GetConsoleWindow(), [IntPtr](-1), 0, 0, 0, 0, [uint32]0x0003) }`;
 }
 
 function configureConsole(options = {}) {
@@ -2842,37 +2918,104 @@ function cleanDownloadsDir() {
   }
 }
 
+// Mark the loader as running by writing our PID. "Switch Spoofer Type" reads
+// this and refuses to open while the loader is live, so the two can't fight over
+// exe-type.txt at the same time.
+function writeLoaderLock() {
+  try {
+    fs.writeFileSync(LOADER_LOCK_FILE, `${process.pid}\r\n${new Date().toISOString()}\r\n`);
+  } catch {
+    // Best-effort: if we can't write the lock, the loader still runs fine.
+  }
+}
+
+function removeLoaderLock() {
+  try {
+    fs.unlinkSync(LOADER_LOCK_FILE);
+  } catch {
+    // Already gone (or never written) - nothing to do.
+  }
+}
+
+// A dropped/absent connection surfaces as one of these. We keep retrying on
+// these (the internet may come back); anything else is a real failure.
+function isNetworkError(err) {
+  const message = String((err && err.message) || err || "");
+  return /net::ERR_|ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_NAME_RESOLUTION|ERR_CONNECTION|ERR_TIMED_OUT|ERR_NETWORK|ERR_ADDRESS_UNREACHABLE|ERR_PROXY|NS_ERROR_|Timeout \d+ms exceeded|timed out/i.test(
+    message
+  );
+}
+
+// Navigate to the site, but survive "browser opened before the internet was
+// ready". Each attempt is short, so the moment the connection returns the next
+// attempt lands the page. Non-network failures are thrown straight away.
+async function gotoWithRetry(page, url, board) {
+  const deadline = Date.now() + NAV_TOTAL_TIMEOUT_MS;
+  let waited = false;
+
+  while (true) {
+    try {
+      await page.goto(url, { waitUntil: "commit", timeout: NAV_ATTEMPT_TIMEOUT_MS });
+      if (waited && board) {
+        board.setDetail("access", "");
+      }
+      return;
+    } catch (err) {
+      if (!isNetworkError(err) || Date.now() >= deadline) {
+        if (isNetworkError(err)) {
+          throw new FriendlyError(
+            "Could not reach launcher.linear.pub. Check your internet connection, then open Get Loader.bat again.",
+            "no_network"
+          );
+        }
+        throw err;
+      }
+
+      waited = true;
+      if (board) {
+        board.setDetail("access", colorRgb("waiting for internet", BANNER_GRADIENT_END));
+      }
+      await sleep(NAV_RETRY_DELAY_MS);
+    }
+  }
+}
+
 async function main() {
-  // Harden the console right away (non-blocking) so clicks/right-clicks can't
-  // freeze or corrupt the run even before the key prompt appears.
-  configureConsoleAsync({ quickEdit: false, pinTopmost: false });
+  // Claim the run lock first thing so the switcher stays blocked for the whole
+  // run; it's cleared on exit by the process "exit" handler below.
+  writeLoaderLock();
+
+  // Harden the console before anything interactive is shown, so mouse drags
+  // cannot put the window into Select mode while the key is being captured.
+  configureConsole({ quickEdit: false, pinTopmost: false });
+  startConsoleLockWatchdog();
 
   printStartupBanner();
 
   const cliKey = process.argv[2];
   const key = await getKeyToUse(cliKey);
 
-  console.log(contentPad() + charcoalGradient(`key: ${maskKey(key)} (${key.length} chars)`));
+  printKeyStatus(key);
 
   if (!key) {
     throw new FriendlyError("No key found in keys.txt. Add a key before running the loader.", "no_key");
   }
 
-  let exeTypePlan = await promptForExeTypePlan();
-  const exeTypeEditor = createExeTypeEditor(exeTypePlan);
-  exeTypeEditor.printInitial();
+  const exeTypePlan = await promptForExeTypePlan();
+  printSpooferStatus(exeTypePlan);
 
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   cleanDownloadsDir();
 
   // Show the whole checklist up front (every dot red); each dot turns blue as
-  // its step actually finishes.
-  const board = createStatusBoard();
-  exeTypeEditor.start();
+  // its step actually finishes. The BE row starts blue if BE already ran this
+  // boot.
+  const board = createStatusBoard({ beUsed: exeTypePlan.beUsedThisBoot });
 
   let browser;
   let page;
   let closeBrowserPromise = null;
+  let stopKeyTimeSync = () => {};
 
   try {
     // By default the browser runs hidden in the background. Set
@@ -2888,16 +3031,13 @@ async function main() {
     page = automation.page;
     const keyField = page.locator("#serialNumber");
 
-    await page.goto(SITE_URL, { waitUntil: "commit" });
+    await gotoWithRetry(page, SITE_URL, board);
     board.complete("access");
 
     const generateButton = page.getByText(/generate loader/i).first();
     await waitForGenerateAfterKey(page, keyField, generateButton, key);
     board.complete("enterKey");
-    readKeyTimeLeft(page)
-      .then(updateHeaderKeyTime)
-      .catch(() => updateHeaderKeyTime("not shown by site"));
-    exeTypePlan = exeTypeEditor.lockLiveSelection();
+    stopKeyTimeSync = startKeyTimeHeaderSync(page);
     const exeType = exeTypePlan.exeType;
     await chooseExeTypeOnWebsite(page, exeType, key);
 
@@ -2905,10 +3045,12 @@ async function main() {
     const savePath = await downloadLoader(board, browser, page, generateButton);
     if (exeType === "be") {
       markBeUsedThisBoot(exeTypePlan.bootId);
+      board.complete("beStatus");
     }
     board.complete("generate");
 
     if (!SHOW_BROWSER) {
+      stopKeyTimeSync();
       closeBrowserPromise = trackBrowserClose(browser);
     }
 
@@ -2917,34 +3059,30 @@ async function main() {
       board.complete("run");
     }
 
-    if (SHOW_BROWSER) {
-      console.log();
-      console.log(contentPad() + charcoalGradient("browser visible: 5 minutes for testing"));
-      await page.waitForTimeout(SHOW_BROWSER_HOLD_MS);
-      closeBrowserPromise = trackBrowserClose(browser);
-    }
-
-    if (launched) {
-      await printFinishedBanner();
-    } else if (!RUN_DOWNLOADED) {
+    if (!launched && !RUN_DOWNLOADED) {
       console.log(color("\nThe file was saved, but LINEAR_NO_RUN is set so it was not launched.", ANSI.red));
-    } else {
+    } else if (!launched) {
       console.log(
         color("\nThe file was saved but is not an .exe, so it was not run.", ANSI.red)
       );
       process.exitCode = 1;
     }
 
-    await closeBrowserPromise;
+    if (SHOW_BROWSER) {
+      await waitForVisibleBrowserClose(browser, page);
+      stopKeyTimeSync();
+    } else {
+      await closeBrowserPromise;
+    }
     if (activeBrowser === browser) {
       activeBrowser = null;
     }
-    exeTypeEditor.stop();
   } catch (err) {
     if (SHOW_BROWSER && page && !page.isClosed()) {
-      console.log();
-      console.log(contentPad() + charcoalGradient("browser visible: 5 minutes to inspect where it stopped"));
-      await page.waitForTimeout(SHOW_BROWSER_HOLD_MS).catch(() => {});
+      await waitForVisibleBrowserClose(browser, page).catch(() => {});
+      stopKeyTimeSync();
+    } else {
+      stopKeyTimeSync();
     }
 
     if (closeBrowserPromise) {
@@ -2952,7 +3090,6 @@ async function main() {
     } else {
       await trackBrowserClose(browser);
     }
-    exeTypeEditor.stop();
     throw err;
   }
 }
@@ -2980,6 +3117,31 @@ function exitAfterFlush(code) {
 }
 
 installCancellationHandlers();
+installResizeHandler();
+// Clear the run lock however we exit -- normal finish, error, or Ctrl+C (which
+// routes through process.exit) all fire "exit", and unlink is safe if it's gone.
+process.on("exit", removeLoaderLock);
+
+// Last-resort safety net: if anything unexpected throws or rejects outside the
+// normal flow, still close the browser and drop the lock instead of leaving an
+// orphaned Chromium or a stale lock behind.
+for (const event of ["uncaughtException", "unhandledRejection"]) {
+  process.on(event, (err) => {
+    if (cancellationStarted) {
+      return;
+    }
+    cancellationStarted = true;
+    showCursor();
+    try {
+      if (process.stdout.isTTY) {
+        process.stdout.write(`\n${color("unexpected error, closing safely...", ANSI.red)}\n`);
+      }
+    } catch {
+      // Ignore a failed write during teardown.
+    }
+    Promise.resolve(closeBrowserQuietly(activeBrowser)).finally(() => process.exit(1));
+  });
+}
 
 main()
   .then(() => {

@@ -1,5 +1,6 @@
 .browser-profile/
 .linear-setup-ready
+.loader-running.lock
 downloads/
 exe-type-boot-state.json
 exe-type.txt

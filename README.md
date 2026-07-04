@@ -25,12 +25,30 @@ If `keys.txt` is empty or missing, the script asks for your key once, saves it
 as the current key, and then future runs are automatic. Invalid text is
 rejected until a real 50-character key is entered.
 
-After the key is ready, the first run asks for spoofer type: press `B` for BE
-or `N` for none. Later runs show both the saved spoofer and the live spoofer
-being downloaded. Press `S` any time after those lines appear to edit the saved
-spoofer, then press `B` or `N`. When the saved spoofer is BE, BE is only used
-once per Windows boot; later runs in the same boot use none temporarily, and the
-next restart enables BE once again.
+After the key is ready, the first run asks for spoofer type: press `1` for BE
+or `2` for none. That choice is saved, and later runs simply show the spoofer
+type being used. When the saved spoofer is BE, BE is only used once per Windows
+boot; later runs in the same boot use none temporarily, and the status board
+shows whether BE has already been used. The next Windows restart enables BE once
+again.
+
+## Switch the spoofer type
+
+To change the saved spoofer type later, double-click `Switch Spoofer Type.bat`
+and press `1` for BE or `2` for none — a single key press, no Enter needed.
+(The old in-run `S` editor was removed; this is now how you switch it.)
+
+It refuses to open while `Get Loader.bat` is running, so close the loader first.
+Switching the type does not clear the per-boot BE-used status; once BE has run,
+it stays used until the next Windows restart.
+
+You can also run it from a terminal:
+
+```
+node set-exe-type.js          asks 1 or 2
+node set-exe-type.js be        sets BE
+node set-exe-type.js none      sets none
+```
 
 You can also run:
 
